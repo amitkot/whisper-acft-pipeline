@@ -1,0 +1,23 @@
+# python / uv
+.venv/
+__pycache__/
+*.pyc
+.python-version
+
+# local outputs
+out/
+data/
+outputs/
+
+# whisper.cpp build products
+external/whisper.cpp/build/
+external/whisper.cpp/**/CMakeFiles/
+external/whisper.cpp/**/CMakeCache.txt
+external/whisper.cpp/**/cmake_install.cmake
+external/whisper.cpp/**/Makefile
+
+# macOS
+.DS_Store
+
+# HF / datasets caches (common locations)
+.cache/
