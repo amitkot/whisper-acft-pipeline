@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+import yaml
+
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     print("\n$", " ".join(cmd))
@@ -77,14 +79,14 @@ def main() -> None:
     ap.add_argument("--config", default="configs/hebrew_tiny_acft.yaml", help="ACFT config yaml")
     ap.add_argument(
         "--final-dir",
-        default="outputs/hebrew_tiny_acft/final",
-        help="HF final checkpoint directory produced by training",
+        default=None,
+        help="HF final checkpoint directory (default: <output_dir>/<run_name>/final from config)",
     )
-    ap.add_argument("--out-dir", default="out", help="Output directory for ggml bins")
+    ap.add_argument("--out-dir", default=None, help="Output directory for ggml bins (default: out/<run_name>)")
     ap.add_argument(
         "--base-name",
-        default="ggml-whisper-tiny-he-2-acft",
-        help="Base filename (without extension) for produced ggml files",
+        default=None,
+        help="Base filename (without extension) for produced ggml files (default: ggml-<run_name>)",
     )
     ap.add_argument(
         "--quants",
@@ -115,8 +117,15 @@ def main() -> None:
 
     repo = resolve_repo_root()
     cfg_path = (repo / args.config).resolve()
-    final_dir = (repo / args.final_dir).resolve()
-    out_dir = (repo / args.out_dir).resolve()
+
+    # Load config to derive defaults
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    run_name = cfg.get("run_name", "default")
+    output_dir = cfg.get("output_dir", "outputs")
+
+    final_dir = (repo / (args.final_dir or f"{output_dir}/{run_name}/final")).resolve()
+    out_dir = (repo / (args.out_dir or f"out/{run_name}")).resolve()
+    base_name = args.base_name or f"ggml-{run_name}"
 
     whisper_cpp = (repo / "external" / "whisper.cpp").resolve()
     openai_whisper = (repo / "external" / "whisper").resolve()
@@ -156,7 +165,7 @@ def main() -> None:
     if not ggml_model.exists():
         raise FileNotFoundError(f"Converter did not produce {ggml_model}")
 
-    base_bin = out_dir / f"{args.base_name}.bin"
+    base_bin = out_dir / f"{base_name}.bin"
     shutil.move(str(ggml_model), str(base_bin))
     print(f"\nCreated base ggml: {base_bin} ({base_bin.stat().st_size / (1024*1024):.1f} MB)")
 
@@ -167,7 +176,7 @@ def main() -> None:
             raise FileNotFoundError(f"Quantizer not found: {quantizer}. Build whisper.cpp first.")
         quants = [q.strip() for q in args.quants.split(",") if q.strip()]
         for q in quants:
-            out_q = out_dir / f"{args.base_name}-{q}.bin"
+            out_q = out_dir / f"{base_name}-{q}.bin"
             run([str(quantizer), str(base_bin), str(out_q), q], cwd=repo)
             produced.append(out_q)
 

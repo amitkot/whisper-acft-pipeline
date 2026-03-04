@@ -8,6 +8,7 @@ __pycache__/
 out/
 data/
 outputs/
+runs/
 
 # whisper.cpp build products
 external/whisper.cpp/build/
