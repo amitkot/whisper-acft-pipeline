@@ -132,23 +132,25 @@ def main() -> None:
     converter = whisper_cpp / "models" / "convert-h5-to-ggml.py"
     quantizer = whisper_cpp / "build" / "bin" / "whisper-quantize"
 
-    # 1) Train
-    if not args.skip_train:
+    # 1) Train (skip if final checkpoint already exists)
+    required = ["config.json", "model.safetensors", "tokenizer.json"]
+    final_complete = final_dir.exists() and all((final_dir / f).exists() for f in required)
+
+    if args.skip_train or final_complete:
+        if final_complete:
+            print(f"\nFinal checkpoint already exists at {final_dir}, skipping training.")
+        if not final_dir.exists():
+            raise FileNotFoundError(f"Final checkpoint dir not found: {final_dir}")
+        missing = [x for x in required if not (final_dir / x).exists()]
+        if missing:
+            raise FileNotFoundError(f"Final dir missing files: {missing} in {final_dir}")
+    else:
         cmd = ["uv", "run", "python", str(repo / "scripts" / "acft_train.py"), "--config", str(cfg_path)]
         if args.resume:
             cmd += ["--resume", args.resume]
         if args.no_resume_latest:
             cmd += ["--no-resume-latest"]
         run(cmd, cwd=repo)
-
-    # 2) Validate HF final checkpoint
-    if not final_dir.exists():
-        raise FileNotFoundError(f"Final checkpoint dir not found: {final_dir}")
-
-    required = ["config.json", "model.safetensors", "tokenizer.json"]
-    missing = [x for x in required if not (final_dir / x).exists()]
-    if missing:
-        raise FileNotFoundError(f"Final dir missing files: {missing} in {final_dir}")
 
     # 3) Tokenizer bridge files for whisper.cpp
     ensure_tokenizer_legacy_files(final_dir)
@@ -169,11 +171,17 @@ def main() -> None:
     shutil.move(str(ggml_model), str(base_bin))
     print(f"\nCreated base ggml: {base_bin} ({base_bin.stat().st_size / (1024*1024):.1f} MB)")
 
-    # 5) Quantize
+    # 5) Build whisper.cpp if needed (for quantizer)
+    if not args.skip_quant and not quantizer.exists():
+        print(f"\nQuantizer not found at {quantizer}, building whisper.cpp...")
+        run(["cmake", "-S", str(whisper_cpp), "-B", str(whisper_cpp / "build")], cwd=repo)
+        run(["cmake", "--build", str(whisper_cpp / "build"), "-j"], cwd=repo)
+        if not quantizer.exists():
+            raise FileNotFoundError(f"Build succeeded but quantizer not found: {quantizer}")
+
+    # 6) Quantize
     produced: list[Path] = [base_bin]
     if not args.skip_quant:
-        if not quantizer.exists():
-            raise FileNotFoundError(f"Quantizer not found: {quantizer}. Build whisper.cpp first.")
         quants = [q.strip() for q in args.quants.split(",") if q.strip()]
         for q in quants:
             out_q = out_dir / f"{base_name}-{q}.bin"

@@ -203,7 +203,7 @@ def _load_training_state(path: Path, optim: torch.optim.Optimizer, sched: torch.
         m = re.match(r"step-(\d+)$", path.name)
         return int(m.group(1)) if m else 0
 
-    state = torch.load(ts, map_location="cpu")
+    state = torch.load(ts, map_location="cpu", weights_only=False)
     step = int(state.get("step", 0))
 
     try:

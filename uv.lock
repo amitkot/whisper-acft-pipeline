@@ -2001,7 +2001,7 @@ wheels = [
 ]
 
 [[package]]
-name = "whisper-convert"
+name = "whisper-acft-pipeline"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
