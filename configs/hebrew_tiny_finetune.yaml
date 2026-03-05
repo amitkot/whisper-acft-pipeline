@@ -1,0 +1,16 @@
+run_name: hebrew_tiny_ft
+base_model: openai/whisper-tiny
+output_dir: outputs
+language: he
+
+# Dataset
+dataset_name: ivrit-ai/whisper-training
+text_column: text
+audio_column: audio
+eval_split: test
+streaming: true
+
+# Runtime
+device: mps
+fp16: false
+seed: 0
