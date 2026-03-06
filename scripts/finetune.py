@@ -350,6 +350,7 @@ def train(cfg: FinetuneConfig) -> None:
         seed=cfg.seed,
         dataloader_num_workers=cfg.dataloader_num_workers,
         dataloader_pin_memory=cfg.device != "mps",
+        ignore_data_skip=cfg.streaming,
         report_to="none",
     )
 
