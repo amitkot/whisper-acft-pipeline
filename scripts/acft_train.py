@@ -12,13 +12,13 @@
 #   "soundfile>=0.12",
 # ]
 # ///
-"""ACFT finetuning for Whisper, packaged as a single uv-run script.
+"""ACFT finetuning for Whisper, aligned with the FUTO reference implementation.
 
-Speed-focused defaults for Apple Silicon (MPS)
-- Uses MPS autocast when fp16=true
-- Uses feature_extractor directly (less overhead than full processor call)
-- Optional: precompute mel features once via dataset.map (biggest speed win)
-- DataLoader tuned for macOS (persistent workers, prefetch)
+Key differences from vanilla approach:
+- Partial encoder with truncated positional embeddings (not crop+pad)
+- Compares ALL decoder hidden states, not just the last
+- Audio context proportional to actual duration with +/-jitter
+- Epoch-based training (8 epochs, batch_size=1)
 
 Inputs
 - A YAML config file (see configs/hebrew_tiny_acft.yaml)
@@ -33,6 +33,7 @@ import argparse
 import dataclasses
 import os
 import random
+import shutil
 import time
 import re
 from pathlib import Path
@@ -68,20 +69,21 @@ class TrainConfig:
     max_train_samples: Optional[int] = None
     max_eval_samples: Optional[int] = 200
 
-    # ACFT: short-context crop length (seconds)
-    min_audio_seconds: float = 1.5
-    max_audio_seconds: float = 12.0
+    # ACFT (FUTO-aligned defaults)
+    max_audio_duration: float = 29.0     # skip audio longer than this
+    acft_jitter_frames: int = 64         # +/-jitter on audio context
 
-    # Optimization
+    # Optimization (FUTO-aligned defaults)
     seed: int = 1337
     device: str = "auto"   # auto|mps|cpu|cuda
     fp16: bool = True      # for MPS: uses autocast float16
-    batch_size: int = 8
-    grad_accum_steps: int = 2
-    lr: float = 2e-5
+    batch_size: int = 1                  # FUTO: per-example processing
+    grad_accum_steps: int = 1            # FUTO: immediate updates
+    lr: float = 1.0e-6                   # FUTO: 1e-6 for all model sizes
     weight_decay: float = 0.01
     warmup_steps: int = 200
-    max_steps: int = 2000
+    num_epochs: int = 8                  # FUTO: 8 epochs
+    max_steps: int = 0                   # 0 = use num_epochs only
     eval_every_steps: int = 250
     save_every_steps: int = 500
 
@@ -90,8 +92,7 @@ class TrainConfig:
     prefetch_factor: int = 2
     persistent_workers: bool = True
 
-    # Precompute features (big speed win). If true, we compute input_features once
-    # and remove raw audio from the hot path.
+    # Precompute features (big speed win)
     precompute_features: bool = True
 
     # Resume
@@ -101,6 +102,10 @@ class TrainConfig:
     # Misc
     log_every_steps: int = 25
     max_text_len: int = 256
+
+    # DEPRECATED -- kept for backward compat, unused in new code
+    min_audio_seconds: float = 1.5
+    max_audio_seconds: float = 12.0
 
 
 def _deep_update(dc: TrainConfig, overrides: Dict[str, Any]) -> TrainConfig:
@@ -139,22 +144,6 @@ def pick_device(pref: str) -> torch.device:
     return torch.device("cpu")
 
 
-def seconds_to_mel_frames(seconds: float) -> int:
-    # Whisper mel features are effectively 100 frames per second.
-    return max(1, int(round(seconds * 100)))
-
-
-def crop_mels(mels: torch.Tensor, target_frames: int) -> torch.Tensor:
-    """Randomly crop mel frames to a shorter segment, then pad back to original length."""
-    frames = mels.shape[-1]
-    if target_frames >= frames:
-        return mels
-    max_start = frames - target_frames
-    start = torch.randint(0, max_start + 1, (1,), device=mels.device).item()
-    crop = mels[..., start : start + target_frames]
-    return F.pad(crop, (0, frames - target_frames))
-
-
 def pad_or_trim_mels(x: torch.Tensor, expected: int = 3000) -> torch.Tensor:
     t = x.shape[-1]
     if t < expected:
@@ -182,41 +171,40 @@ def _find_latest_checkpoint(out_root: Path) -> Optional[Path]:
     return best_path
 
 
-def _save_training_state(out_dir: Path, optim: torch.optim.Optimizer, sched: torch.optim.lr_scheduler._LRScheduler, step: int) -> None:
+def _save_training_state(out_dir: Path, step: int, epoch: int = 0) -> None:
     state = {
         "step": step,
-        "optim": optim.state_dict(),
-        "sched": sched.state_dict(),
+        "epoch": epoch,
         "rng": {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
             "torch": torch.random.get_rng_state(),
-            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
     }
     torch.save(state, out_dir / "training_state.pt")
 
 
-def _load_training_state(path: Path, optim: torch.optim.Optimizer, sched: torch.optim.lr_scheduler._LRScheduler) -> int:
+def _load_training_state(path: Path, steps_per_epoch: int = 0) -> Tuple[int, int]:
+    """Returns (step, epoch). Reconstructs from dir name if state file is missing/corrupt."""
     ts = path / "training_state.pt"
-    if not ts.exists():
+
+    def _from_dir_name() -> Tuple[int, int]:
         m = re.match(r"step-(\d+)$", path.name)
-        return int(m.group(1)) if m else 0
+        s = int(m.group(1)) if m else 0
+        e = s // steps_per_epoch if steps_per_epoch > 0 else 0
+        return s, e
 
-    state = torch.load(ts, map_location="cpu", weights_only=False)
+    if not ts.exists():
+        return _from_dir_name()
+
+    try:
+        state = torch.load(ts, map_location="cpu", weights_only=False)
+    except RuntimeError:
+        print("WARNING: training_state.pt is corrupt, recovering from dir name")
+        return _from_dir_name()
+
     step = int(state.get("step", 0))
-
-    try:
-        optim.load_state_dict(state["optim"])
-    except Exception:
-        pass
-    try:
-        sched.load_state_dict(state["sched"])
-    except Exception:
-        try:
-            sched.last_epoch = step - 1
-        except Exception:
-            pass
+    epoch = int(state.get("epoch", 0))
 
     rng = state.get("rng") or {}
     try:
@@ -232,7 +220,7 @@ def _load_training_state(path: Path, optim: torch.optim.Optimizer, sched: torch.
     except Exception:
         pass
 
-    return step
+    return step, epoch
 
 
 # -----------------------------
@@ -263,6 +251,7 @@ def maybe_precompute_features(ds: Dataset, processor: WhisperProcessor, cfg: Tra
 
     def _map(ex: Dict[str, Any]) -> Dict[str, Any]:
         arr = ex[cfg.audio_column]["array"]
+        ex["audio_duration"] = len(arr) / 16000.0
         feats = fe(arr, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, T)
         feats = pad_or_trim_mels(feats, 3000)
         ex["input_features"] = feats.to(torch.float32).numpy()
@@ -270,7 +259,7 @@ def maybe_precompute_features(ds: Dataset, processor: WhisperProcessor, cfg: Tra
 
     num_proc = max(1, min(cfg.num_workers, os.cpu_count() or 1))
     ds2 = ds.map(_map, num_proc=num_proc, desc="Precomputing mel features (one-time)")
-    keep = [cfg.text_column, "input_features"]
+    keep = [cfg.text_column, "input_features", "audio_duration"]
     drop = [c for c in ds2.column_names if c not in keep]
     return ds2.remove_columns(drop)
 
@@ -286,9 +275,11 @@ class Collator:
 
         if "input_features" in batch[0]:
             feats = torch.tensor([b["input_features"] for b in batch], dtype=torch.float32)
+            durations = torch.tensor([b["audio_duration"] for b in batch], dtype=torch.float32)
         else:
-            audio = [b[self.cfg.audio_column]["array"] for b in batch]
-            inputs = self.fe(audio, sampling_rate=16000, return_tensors="pt")
+            audio_arrays = [b[self.cfg.audio_column]["array"] for b in batch]
+            durations = torch.tensor([len(a) / 16000.0 for a in audio_arrays], dtype=torch.float32)
+            inputs = self.fe(audio_arrays, sampling_rate=16000, return_tensors="pt")
             feats = pad_or_trim_mels(inputs.input_features, 3000)
 
         labels = self.tok(
@@ -300,25 +291,75 @@ class Collator:
         ).input_ids
         labels[labels == self.tok.pad_token_id] = -100
 
-        return {"input_features": feats, "labels": labels}
+        return {"input_features": feats, "labels": labels, "audio_durations": durations}
 
 
 # -----------------------------
-# ACFT objective
+# ACFT objective (FUTO-aligned)
 # -----------------------------
 
-def forward_hidden_states(
+def compute_n_ctx(audio_duration: float, cfg: TrainConfig, jitter: bool = True) -> int:
+    """Compute audio context frames proportional to actual duration, with optional jitter."""
+    n_ctx = round(50.0 * audio_duration)  # 50 frames/sec = 1500/30s
+    n_ctx = max(1, min(n_ctx, 1500))
+    if jitter:
+        max_j = min(cfg.acft_jitter_frames, n_ctx // 3)
+        if max_j > 0:
+            n_ctx += random.randint(-max_j, max_j)
+            n_ctx = max(1, min(n_ctx, 1500))
+    return n_ctx
+
+
+def compute_partial_encoder(
     model: WhisperForConditionalGeneration,
     input_features: torch.Tensor,
-    decoder_input_ids: torch.Tensor,
+    n_audio_ctx: int,
 ) -> torch.Tensor:
-    out = model.model(
-        input_features=input_features,
-        decoder_input_ids=decoder_input_ids,
+    """Run encoder with truncated positional embeddings for shorter context.
+
+    Returns encoder hidden states of shape (B, n_audio_ctx, d_model).
+    Falls back to standard encoder when n_audio_ctx >= 1500.
+    """
+    encoder = model.model.encoder
+
+    if n_audio_ctx >= 1500:
+        return encoder(input_features=input_features).last_hidden_state
+
+    mel_frames = 2 * n_audio_ctx  # conv2 stride=2
+    mel_trimmed = input_features[:, :, :mel_frames]
+
+    hidden_states = F.gelu(encoder.conv1(mel_trimmed))
+    hidden_states = F.gelu(encoder.conv2(hidden_states))
+    hidden_states = hidden_states.permute(0, 2, 1)  # (B, n_audio_ctx, d_model)
+
+    hidden_states = hidden_states + encoder.embed_positions.weight[:n_audio_ctx]
+
+    hidden_states = F.dropout(hidden_states, p=encoder.dropout, training=encoder.training)
+
+    for layer in encoder.layers:
+        if encoder.training:
+            dropout_probability = torch.rand([])
+            if dropout_probability < encoder.layerdrop:
+                continue
+        hidden_states = layer(hidden_states, attention_mask=None)[0]
+
+    hidden_states = encoder.layer_norm(hidden_states)
+    return hidden_states
+
+
+def forward_decoder_all_hidden_states(
+    model: WhisperForConditionalGeneration,
+    encoder_hidden_states: torch.Tensor,
+    decoder_input_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, ...]:
+    """Run decoder and return ALL hidden states (embedding + each layer)."""
+    out = model.model.decoder(
+        input_ids=decoder_input_ids,
+        encoder_hidden_states=encoder_hidden_states,
         output_hidden_states=True,
         return_dict=True,
     )
-    return out.decoder_hidden_states[-1]
+    return out.hidden_states
 
 
 def make_decoder_inputs(labels: torch.Tensor, bos_token_id: int) -> torch.Tensor:
@@ -342,12 +383,22 @@ def save_checkpoint_full(
     model: WhisperForConditionalGeneration,
     processor: WhisperProcessor,
     out_dir: Path,
-    optim: torch.optim.Optimizer,
-    sched: torch.optim.lr_scheduler._LRScheduler,
     step: int,
+    epoch: int = 0,
 ) -> None:
     save_checkpoint(model, processor, out_dir)
-    _save_training_state(out_dir, optim, sched, step)
+    _save_training_state(out_dir, step, epoch)
+
+
+def _cleanup_old_checkpoints(out_root: Path, keep: Path) -> None:
+    """Delete all step-* checkpoint dirs except `keep`."""
+    for p in out_root.iterdir():
+        if not p.is_dir() or not re.match(r"step-\d+$", p.name):
+            continue
+        if p.resolve() == keep.resolve():
+            continue
+        shutil.rmtree(p)
+        print(f"Removed old checkpoint: {p}")
 
 
 @torch.no_grad()
@@ -359,26 +410,33 @@ def eval_loss(
     processor: WhisperProcessor,
     cfg: TrainConfig,
 ) -> float:
-    model_ref.eval()
     model_train.eval()
     losses: List[float] = []
 
     for batch in dl:
         feats = batch["input_features"].to(device)
         labels = batch["labels"].to(device)
+        durations = batch["audio_durations"]
         dec_in = make_decoder_inputs(labels, processor.tokenizer.bos_token_id)
 
-        h_full = forward_hidden_states(model_ref, feats, dec_in)
+        for i in range(feats.size(0)):
+            duration = durations[i].item()
+            if duration > cfg.max_audio_duration:
+                continue
 
-        min_frames = seconds_to_mel_frames(cfg.min_audio_seconds)
-        max_frames = seconds_to_mel_frames(cfg.max_audio_seconds)
-        target_frames = int(torch.randint(min_frames, max_frames + 1, (1,), device=device).item())
-        feats_short = crop_mels(feats, target_frames)
+            n_ctx = compute_n_ctx(duration, cfg, jitter=False)
+            f_i = feats[i : i + 1]
+            d_i = dec_in[i : i + 1]
 
-        h_short = forward_hidden_states(model_train, feats_short, dec_in)
-        losses.append(torch.mean((h_short - h_full) ** 2).item())
+            enc_full = model_ref.model.encoder(input_features=f_i).last_hidden_state
+            h_full = forward_decoder_all_hidden_states(model_ref, enc_full, d_i)
 
-    model_ref.train()
+            enc_partial = compute_partial_encoder(model_train, f_i, n_ctx)
+            h_partial = forward_decoder_all_hidden_states(model_train, enc_partial, d_i)
+
+            loss = F.mse_loss(torch.cat(h_partial, 0), torch.cat(h_full, 0))
+            losses.append(loss.item())
+
     model_train.train()
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -394,6 +452,10 @@ def _autocast_ctx(device: torch.device, fp16: bool):
 
 
 def train(cfg: TrainConfig) -> None:
+    if cfg.min_audio_seconds != 1.5 or cfg.max_audio_seconds != 12.0:
+        print("WARNING: min_audio_seconds/max_audio_seconds are deprecated and ignored. "
+              "Audio context is now computed from actual duration.")
+
     set_seed(cfg.seed)
 
     try:
@@ -414,7 +476,6 @@ def train(cfg: TrainConfig) -> None:
     elif cfg.resume_latest:
         resume_path = _find_latest_checkpoint(out_root)
 
-    resume_step = 0
     if resume_path is not None and resume_path.exists():
         print(f"Resuming from checkpoint: {resume_path}")
         processor = WhisperProcessor.from_pretrained(str(resume_path))
@@ -467,7 +528,14 @@ def train(cfg: TrainConfig) -> None:
             prefetch_factor=(cfg.prefetch_factor if nw > 0 else None),
         )
 
-    step = 0
+    # Compute total training steps
+    steps_per_epoch = len(train_ds) // cfg.grad_accum_steps
+    total_steps = steps_per_epoch * cfg.num_epochs
+    if cfg.max_steps > 0:
+        total_steps = cfg.max_steps
+
+    print(f"Dataset size: {len(train_ds)}, epochs: {cfg.num_epochs}, "
+          f"est. total steps: {total_steps}")
 
     params = [p for p in model_train.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -475,78 +543,90 @@ def train(cfg: TrainConfig) -> None:
     sched = get_cosine_schedule_with_warmup(
         optim,
         num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=cfg.max_steps,
+        num_training_steps=total_steps,
     )
 
-    # Restore optimizer/scheduler state if available
+    step = 0
+    start_epoch = 0
+
     if resume_path is not None and resume_path.exists():
-        resume_step = _load_training_state(resume_path, optim, sched)
+        resume_step, resume_epoch = _load_training_state(resume_path, steps_per_epoch)
         if resume_step > 0:
             step = resume_step
-            print(f"Resumed training state at step={step}")
+            start_epoch = resume_epoch
+            print(f"Resumed training state at step={step}, epoch={start_epoch}")
 
-    accum = 0
     running: List[float] = []
     start = time.time()
+    accum = 0
+    done = False
+    epoch = start_epoch
 
     model_train.train()
 
-    it = iter(train_dl)
-    while step < cfg.max_steps:
-        try:
-            batch = next(it)
-        except StopIteration:
-            it = iter(train_dl)
-            batch = next(it)
+    for epoch in range(start_epoch, cfg.num_epochs):
+        if done:
+            break
+        print(f"--- Epoch {epoch + 1}/{cfg.num_epochs} ---")
 
-        feats = batch["input_features"].to(device)
-        labels = batch["labels"].to(device)
-        dec_in = make_decoder_inputs(labels, processor.tokenizer.bos_token_id)
+        for batch in train_dl:
+            if cfg.max_steps > 0 and step >= cfg.max_steps:
+                done = True
+                break
 
-        with torch.no_grad():
+            duration = batch["audio_durations"][0].item()
+            if duration > cfg.max_audio_duration:
+                continue
+
+            feats = batch["input_features"].to(device)
+            labels = batch["labels"].to(device)
+            dec_in = make_decoder_inputs(labels, processor.tokenizer.bos_token_id)
+
+            n_ctx = compute_n_ctx(duration, cfg, jitter=True)
+
+            with torch.no_grad():
+                with _autocast_ctx(device, cfg.fp16):
+                    enc_full = model_ref.model.encoder(input_features=feats).last_hidden_state
+                    h_full = forward_decoder_all_hidden_states(model_ref, enc_full, dec_in)
+
             with _autocast_ctx(device, cfg.fp16):
-                h_full = forward_hidden_states(model_ref, feats, dec_in)
+                enc_partial = compute_partial_encoder(model_train, feats, n_ctx)
+                h_partial = forward_decoder_all_hidden_states(model_train, enc_partial, dec_in)
+                loss = F.mse_loss(torch.cat(h_partial, 0), torch.cat(h_full, 0))
 
-        min_frames = seconds_to_mel_frames(cfg.min_audio_seconds)
-        max_frames = seconds_to_mel_frames(cfg.max_audio_seconds)
-        target_frames = int(torch.randint(min_frames, max_frames + 1, (1,), device=device).item())
-        feats_short = crop_mels(feats, target_frames)
+            (loss / cfg.grad_accum_steps).backward()
 
-        with _autocast_ctx(device, cfg.fp16):
-            h_short = forward_hidden_states(model_train, feats_short, dec_in)
-            loss = torch.mean((h_short - h_full) ** 2)
+            running.append(float(loss.item()))
+            accum += 1
 
-        (loss / cfg.grad_accum_steps).backward()
+            if accum >= cfg.grad_accum_steps:
+                optim.step()
+                optim.zero_grad(set_to_none=True)
+                sched.step()
 
-        running.append(float(loss.item()))
-        accum += 1
+                step += 1
+                accum = 0
 
-        if accum >= cfg.grad_accum_steps:
-            optim.step()
-            optim.zero_grad(set_to_none=True)
-            sched.step()
+                if step % cfg.log_every_steps == 0:
+                    dt = time.time() - start
+                    avg = float(np.mean(running[-cfg.log_every_steps:]))
+                    lr = sched.get_last_lr()[0]
+                    print(f"[step {step}] loss={avg:.6f} lr={lr:.2e} epoch={epoch+1} time={dt:.1f}s")
 
-            step += 1
-            accum = 0
+                if eval_dl is not None and step % cfg.eval_every_steps == 0:
+                    ev = eval_loss(model_ref, model_train, eval_dl, device, processor, cfg)
+                    print(f"[step {step}] eval_mse={ev:.6f}")
 
-            if step % cfg.log_every_steps == 0:
-                dt = time.time() - start
-                avg = float(np.mean(running[-cfg.log_every_steps :]))
-                lr = sched.get_last_lr()[0]
-                print(f"[{step}/{cfg.max_steps}] loss={avg:.6f} lr={lr:.2e} time={dt:.1f}s")
-
-            if eval_dl is not None and step % cfg.eval_every_steps == 0:
-                ev = eval_loss(model_ref, model_train, eval_dl, device, processor, cfg)
-                print(f"[{step}] eval_mse={ev:.6f}")
-
-            if step % cfg.save_every_steps == 0:
-                ckpt = out_root / f"step-{step}"
-                save_checkpoint_full(model_train, processor, ckpt, optim, sched, step)
-                print(f"Saved checkpoint: {ckpt}")
+                if step % cfg.save_every_steps == 0:
+                    ckpt = out_root / f"step-{step}"
+                    save_checkpoint_full(model_train, processor, ckpt, step, epoch)
+                    print(f"Saved checkpoint: {ckpt}")
+                    _cleanup_old_checkpoints(out_root, keep=ckpt)
 
     final_dir = out_root / "final"
-    save_checkpoint_full(model_train, processor, final_dir, optim, sched, step)
-    print(f"Saved final checkpoint: {final_dir}")
+    save_checkpoint_full(model_train, processor, final_dir, step, epoch)
+    _cleanup_old_checkpoints(out_root, keep=final_dir)
+    print(f"Saved final checkpoint: {final_dir} (step={step})")
 
 
 def main() -> None:

@@ -10,21 +10,9 @@ eval_split: validation
 text_column: raw_transcription
 audio_column: audio
 
-# ACFT cropping
-min_audio_seconds: 1.5
-max_audio_seconds: 12.0
-
-# Optimization and runtime
-device: mps          # "auto" | "mps" | "cpu" | "cuda"
+# Runtime
+device: mps
 fp16: true
 precompute_features: true
-# These only matter for the one-time precompute map:
 num_workers: 4
-batch_size: 8
-grad_accum_steps: 2
-lr: 1.0e-6
-max_steps: 2000
-eval_every_steps: 250
-save_every_steps: 500
-log_every_steps: 25
 seed: 0
