@@ -1,0 +1,22 @@
+run_name: hebrew_small_ft
+base_model: openai/whisper-small
+output_dir: outputs
+language: he
+
+# Dataset
+dataset_name: ivrit-ai/whisper-training
+text_column: text
+audio_column: audio
+eval_split: test
+streaming: true
+
+# Training (smaller batch for ~244M param model on 48GB MPS)
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 4
+max_steps: 5000
+
+# Runtime
+device: mps
+fp16: false
+seed: 0

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -375,6 +376,37 @@ def train(cfg: FinetuneConfig) -> None:
     print(f"Saved fine-tuned model to: {final_dir}")
 
 
+_NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
+try:
+    import requests as _requests
+    _NETWORK_ERRORS = _NETWORK_ERRORS + (
+        _requests.exceptions.ConnectionError,
+        _requests.exceptions.ChunkedEncodingError,
+        _requests.exceptions.Timeout,
+    )
+except ImportError:
+    pass
+
+
+def train_with_retry(cfg: FinetuneConfig, max_retries: int = 20, base_delay: int = 30) -> None:
+    """Call train(), retrying on network errors with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            train(cfg)
+            return
+        except _NETWORK_ERRORS as exc:
+            delay = min(base_delay * (2 ** attempt), 300)
+            print(f"\nNetwork error on attempt {attempt + 1}: {exc}")
+            print(f"Retrying in {delay}s (will auto-resume from latest checkpoint)...")
+            time.sleep(delay)
+    print(f"ERROR: Training failed after {max_retries} network retries.")
+    raise SystemExit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Fine-tune Whisper for speech recognition")
     ap.add_argument("--config", type=str, default="configs/hebrew_tiny_finetune.yaml")
@@ -394,7 +426,7 @@ def main() -> None:
     if args.no_resume_latest:
         cfg = dataclasses.replace(cfg, resume_latest=False)
 
-    train(cfg)
+    train_with_retry(cfg)
 
 
 if __name__ == "__main__":
