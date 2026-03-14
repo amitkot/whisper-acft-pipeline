@@ -75,6 +75,7 @@ class FinetuneConfig:
     per_device_eval_batch_size: int = 8
     gradient_accumulation_steps: int = 2
     learning_rate: float = 1e-5
+    lr_scheduler_type: str = "linear"
     warmup_steps: int = 500
     weight_decay: float = 0.01
     fp16: bool = True
@@ -334,6 +335,7 @@ def train(cfg: FinetuneConfig) -> None:
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
+        lr_scheduler_type=cfg.lr_scheduler_type,
         warmup_steps=cfg.warmup_steps,
         weight_decay=cfg.weight_decay,
         fp16=use_fp16,
