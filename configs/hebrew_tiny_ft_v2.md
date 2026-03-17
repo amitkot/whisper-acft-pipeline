@@ -74,11 +74,12 @@ which uses much more memory than training (which only does a forward pass).
 The v1 small model run crashed with OOM during eval when using the default
 eval_batch_size=4. Set to 1 to be safe on MPS.
 
-### `save_steps: 250`
-v1 saved every 500 steps. At ~2s/step, that's up to ~8 minutes of lost work if
-interrupted between saves. 250 steps ≈ 4 minutes of exposure. The checkpoint
-files are small enough (the model is only 39M params) that saving twice as often
-has negligible overhead.
+### `save_steps: 250` / `eval_steps: 250`
+v1 saved and evaluated every 500 steps. At ~2s/step, that's up to ~8 minutes of
+lost work if interrupted between saves. 250 steps ≈ 4 minutes of exposure.
+Note: `load_best_model_at_end=True` requires `save_steps` to be a round multiple
+of `eval_steps`, so both are set to 250. The checkpoint files are small (39M params)
+and eval takes ~28s, so the overhead is acceptable.
 
 ### `save_total_limit: 2`
 Keeps the two most recent checkpoints instead of one. Protects against a corrupt
