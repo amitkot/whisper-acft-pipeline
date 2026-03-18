@@ -1,5 +1,5 @@
 run_name: hebrew_base_distill
-student_model: openai/whisper-base
+student_model: outputs/hebrew_base_ft/final
 teacher_model: ivrit-ai/whisper-large-v3-turbo
 output_dir: outputs
 language: he
