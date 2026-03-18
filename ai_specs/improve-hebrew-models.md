@@ -5,18 +5,71 @@ Supersedes `improve-hebrew-tiny-model.md`.
 
 ---
 
-## Current state
+## Current state (as of 2026-03-18)
 
-| Model | Params | Best WER | Step | Config |
-|---|---|---|---|---|
-| whisper-tiny v1 | 39M | 0.636 | 3000 | `hebrew_tiny_ft` — linear LR, resume artifact |
-| whisper-tiny v2 | 39M | 0.557 | 8500 | `hebrew_tiny_ft_v2` — cosine, 3 epochs, clean run |
-| whisper-small | 244M | 0.368 | 4000 | `hebrew_small_ft` — only ~1 epoch seen |
-| whisper-base | 74M | not yet trained | — | `hebrew_base_ft` — next step |
+### Reliable WER numbers (2000-sample eval via `scripts/eval.py`)
 
-All WER numbers: `ivrit-ai/whisper-training` test split, 200 samples, `jiwer.wer()`,
-**no normalization**. Numbers are comparable to each other but not to published benchmarks
-(which use OpenAI's text normalizer and cleaner datasets like LibriSpeech).
+| Model | Params | WER (untuned) | WER (fine-tuned) | Config | Notes |
+|---|---|---|---|---|---|
+| whisper-tiny | 39M | 1.004 | 0.581 | `hebrew_tiny_ft_v2` | 3 clean epochs, cosine |
+| whisper-base | 74M | 0.851 | 0.596 | `hebrew_base_ft` | 3 clean epochs, cosine |
+| whisper-small | 244M | 0.503 | 0.367 | `hebrew_small_ft` | only ~1 epoch, undertrained |
+
+WER numbers: `ivrit-ai/whisper-training` test split, 2000 samples, `jiwer.wer()`, **no normalization**.
+Comparable to each other but not to published benchmarks (which use OpenAI's text normalizer).
+
+**Eval command:**
+```bash
+uv run python scripts/eval.py \
+    openai/whisper-tiny openai/whisper-base openai/whisper-small \
+    outputs/hebrew_tiny_ft_v2/final outputs/hebrew_base_ft/final outputs/hebrew_small_ft/final \
+    --samples 2000
+```
+
+### Earlier training-time WER (200 samples — treat as noisy)
+
+Training logs report WER every `eval_steps` on 200 samples. These numbers showed
+base (0.541) beating tiny (0.557), which turned out to be noise.
+**Always use `scripts/eval.py` with ≥1000 samples for reliable comparisons.**
+
+---
+
+## Key findings from experimentation
+
+### Finding 1: Base does not beat tiny
+
+Base (74M, 0.596) is slightly *worse* than tiny (39M, 0.581) on the proper 2000-sample eval.
+The apparent advantage seen during training (0.541 vs 0.557) was 200-sample noise.
+
+**Why**: Both tiny and base start from a poor Hebrew pre-training (untuned WER ~1.0 and ~0.85).
+Fine-tuning has to teach them Hebrew nearly from scratch on the same data. In that regime,
+base's extra parameters are a liability — more parameters, same data = more underdetermined.
+They converge to essentially the same ceiling.
+
+### Finding 2: Small has a qualitatively different starting point
+
+Small (untuned WER 0.503) already speaks Hebrew before any fine-tuning. Tiny and base
+(~1.0 and ~0.85) essentially don't. This reflects a pre-training threshold — at ~200M+
+params trained on 680k hours, Whisper absorbs enough Hebrew to be genuinely useful as a
+starting point. Below that threshold, Hebrew knowledge from pre-training is weak.
+
+**Implication**: Fine-tuning small is *adapting* an already-capable model. Fine-tuning
+tiny/base is *teaching* a model Hebrew from scratch. Adaptation is more data-efficient.
+This is why small outperforms despite having the worst data-per-parameter ratio.
+
+### Finding 3: Base is still worth pursuing — for inference speed
+
+For keyboard dictation, inference latency matters. Base runs ~3× faster than small on device.
+If base can be brought to competitive WER, it is preferable to small for the use case.
+
+The path to better base WER is **distillation from small**, not direct fine-tuning.
+See Option 3 below.
+
+### Finding 4: Small is heavily undertrained
+
+`hebrew_small_ft` saw only ~1 epoch with a resume artifact and linear LR schedule —
+the same situation as tiny v1 (which improved from 0.636 to 0.581 with a clean run).
+Small's true ceiling with 3 clean epochs is likely 0.28–0.32.
 
 ---
 
@@ -24,214 +77,155 @@ All WER numbers: `ivrit-ai/whisper-training` test split, 200 samples, `jiwer.wer
 
 Source: [ivrit.ai — "Fine Tune Whisper the Right Way"](https://www.ivrit.ai/en/2025/02/13/training-whisper/)
 
-ivrit.ai's core lesson is that training distribution must match inference format.
-Their warning about timestamps and long-form conditioning is **irrelevant for keyboard
-dictation** — it only matters when stitching 30-second chunks for long audio.
-
 For keyboard dictation:
-- Users speak one sentence or short phrase at a time
+- Users speak one sentence or short phrase at a time (~5s clips)
 - No 30-second boundaries, no timestamp tokens, no previous-text conditioning needed
-- **Short supervised clips (~5s) are the ideal training format**
-- What ivrit.ai considered a limitation of their short-clip dataset is actually a feature for us
+- **Short supervised clips are the ideal training format**
+- `ivrit-ai/whisper-training` is perfectly aligned with this use case
 
 See `ai_specs/datasets.md` for full dataset analysis.
 
 ---
 
-## Option 1: Fine-tune a larger model in the tiny→small range
+## Option 1: Clean run of small — hebrew_small_ft_v2
 
-### whisper-base (74M params)
+**Status: not yet done. Highest priority.**
 
-The only official model between tiny (39M) and small (244M).
-Config: `configs/hebrew_base_ft.yaml` — see `configs/hebrew_base_ft.md` for rationale.
+`hebrew_small_ft` only saw ~1 epoch. A clean 3-epoch cosine run should yield WER ~0.28–0.32,
+establishing the true ceiling for small and providing a strong teacher for distillation.
 
-**Process**: Identical to tiny fine-tuning, just `base_model: openai/whisper-base`.
-No code changes needed.
-
-**Expected WER**: ~0.47–0.52 (interpolating between tiny=0.557 and small=0.368,
-weighted by capacity ratio).
-
-**Training time**: ~4–5 hours on M4 MPS (~2× tiny, ~0.5× small).
-
-**Recommendation**: Do this first. Lowest effort, likely meaningful gain.
-
-```bash
-uv run python scripts/finetune.py --config configs/hebrew_base_ft.yaml
+**Config to create** (`configs/hebrew_small_ft_v2.yaml`):
+```yaml
+run_name: hebrew_small_ft_v2
+base_model: openai/whisper-small
+output_dir: outputs
+language: he
+dataset_name: ivrit-ai/whisper-training
+text_column: text
+audio_column: audio
+eval_split: test
+streaming: true
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 4
+max_steps: 15000
+learning_rate: 6.0e-6
+lr_scheduler_type: cosine
+warmup_steps: 500
+save_steps: 250
+save_total_limit: 2
+eval_steps: 250
+device: mps
+fp16: false
+seed: 42
 ```
-
----
-
-## Option 2: Continue training small model
-
-`hebrew_small_ft` only saw ~1 epoch of data (stopped at step 4000, best WER 0.368).
-The model is undertrained — the same pattern as tiny v1.
-
-**Process**: Create `hebrew_small_ft_v2.yaml` following the same pattern as
-`hebrew_tiny_ft_v2.yaml`:
-- `base_model: openai/whisper-small`
-- `lr_scheduler_type: cosine`
-- `max_steps: 15000` (~3 epochs)
-- `learning_rate: 6.0e-6` (slightly lower than tiny; larger model is more sensitive)
-- `save_total_limit: 2`, `save_steps: 250`, `eval_steps: 250`
-
-**Expected WER**: Potentially 0.30–0.34 (small has more capacity; 3 clean epochs
-could push well below current 0.368).
 
 **Training time**: ~16–18 hours on M4 MPS.
 
+**Why this matters beyond just WER**: The resulting `hebrew_small_ft_v2/final` model
+becomes the teacher for distilling into base (Option 3).
+
 ---
 
-## Option 3: Add more datasets (multi-dataset training)
+## Option 2: Distillation from small → base
 
-### Why it helps
+**This is the most promising path to a fast, accurate model.**
 
-More diverse short Hebrew speech teaches the model acoustic patterns not present in
-`ivrit-ai/whisper-training` alone (different speakers, mics, accents, speaking styles).
-For dictation, **speaker and mic diversity matters more than total hours**.
+Base (74M) is ~3× faster than small at inference — ideal for keyboard dictation.
+Direct fine-tuning hit a ceiling at WER 0.596. Distillation from small can transfer
+small's Hebrew knowledge into base without requiring more data.
 
-### Best first addition: crowd-transcribe-v5
+### Does this require more data?
 
-- ~300h, not gated, diverse speakers
-- Filter out `noisy=True` and `multiple_speakers=True` examples
-- Expected gain: reduces OOV errors on speaker/acoustic variety; WER improvement ~5–10%
+**No.** Distillation works on the same `ivrit-ai/whisper-training` dataset.
+The small model acts as a teacher, generating richer training signal from the same audio.
 
-### Implementation needed in finetune.py
+### Soft-label distillation process
 
+Train base to match small's full output probability distribution at every decoder step,
+combined with the ground truth labels:
+
+```
+loss = α × CrossEntropy(base_logits, ground_truth_tokens)
+     + (1−α) × KL_divergence(base_logits, small_logits)
+```
+
+α = 0.5 is a sensible default.
+
+**Step 1**: Fine-tune `hebrew_small_ft_v2` to completion (Option 1).
+
+**Step 2**: Write a distillation training script (`scripts/distill.py`):
+- Load small model frozen as teacher
+- Load base model as student (initialize from `outputs/hebrew_base_ft/final` or fresh)
+- For each batch: run teacher in `torch.no_grad()`, compute KL loss against student
+- Train student with combined CE + KL loss
+
+**Step 3**: Run on same dataset, same cosine schedule.
+
+**Implementation notes**:
+- Both models in memory simultaneously: small (~900MB fp32) + base (~280MB) = ~1.2GB total, fine on M4
+- Cannot use `Seq2SeqTrainer` directly — needs a custom training loop or subclass
+- α is an additional hyperparameter; start with 0.5
+
+**Expected WER**: Potentially 0.45–0.52. Distillation from a teacher with WER 0.28–0.30
+(after small_ft_v2) could meaningfully improve over base's direct fine-tune ceiling of 0.596.
+
+### Pseudo-label distillation (simpler alternative)
+
+Run small over the training audio, use its transcriptions as hard labels for base.
+No custom training loop needed — reuses `finetune.py` directly.
+Less powerful than soft-label distillation but much simpler to implement.
+
+---
+
+## Option 3: More training data
+
+**Status: not yet done. Do after Options 1 and 2.**
+
+If the dataset is the bottleneck for tiny/base, more diverse Hebrew speech could push
+them below their current WER ceiling. For dictation, speaker and mic diversity matter
+more than total hours.
+
+**Best first addition**: `ivrit-ai/crowd-transcribe-v5` (~300h, not gated, diverse speakers).
+Filter `noisy=True` and `multiple_speakers=True` before use.
+
+**Implementation needed**: Multi-dataset interleaving loader in `finetune.py`:
 ```python
 from datasets import interleave_datasets
-
-combined = interleave_datasets(
-    [ds_primary, ds_secondary],
-    probabilities=[0.7, 0.3],  # weight cleaner data higher
-    seed=cfg.seed,
-)
+combined = interleave_datasets([ds_primary, ds_secondary], probabilities=[0.7, 0.3])
 ```
 
-The config needs new fields: `dataset_name_2`, `dataset_config_2`, `text_column_2`,
-`audio_column_2`, `dataset_weight` (primary proportion).
-
-### Dataset priority for dictation
-
-1. `ivrit-ai/crowd-transcribe-v5` — short clips, diverse, not gated (**do first**)
-2. `fsicoli/common_voice_22_0` (he) — community, mobile-like audio
-3. `ivrit-ai/crowd-recital-whisper-training` — clean read speech (lower priority)
-4. Skip `knesset-plenums` — parliamentary long-form is wrong domain
-
-See `ai_specs/datasets.md` for full details on each.
+See `ai_specs/datasets.md` for full dataset details and priority ordering.
 
 ---
 
-## Option 4: Pseudo-labeling from whisper-small-he
+## Option 4: Pseudo-labeling with unlabeled audio
 
-### What it is
+Use small to transcribe `ivrit-ai/audio-v2` (~800h unlabeled), then train
+tiny/base on those transcriptions. Expands training data volume significantly.
 
-Use the stronger model (small, WER 0.368) to transcribe unlabeled Hebrew audio, then
-train tiny/base on those transcriptions as supervised data. This is the core of
-[DistilWhisper](https://github.com/huggingface/distil-whisper), which achieved
-~2–5% absolute WER improvement using this technique.
+Requires strict quality filtering of small's outputs before use as training labels.
+See previous version of this doc for detailed process steps.
 
-### Why it works
-
-The small model has seen more of the Hebrew distribution than tiny has "capacity" to
-represent directly. Its transcriptions of unlabeled audio encode knowledge that tiny
-can absorb via supervised training, without tiny needing to learn it from scratch.
-
-### Process
-
-**Step 1 — Generate pseudo-labels**
-```python
-# Run whisper-small-he over unlabeled audio (ivrit-ai/audio-v2, ~800h)
-from transformers import pipeline
-pipe = pipeline("automatic-speech-recognition", model="amitkot/whisper-small-he")
-result = pipe(audio_array)  # → {"text": "..."}
-```
-
-**Step 2 — Filter for quality**
-Discard clips where the output is unreliable:
-- Output contains `[BLANK_AUDIO]` or repetition loops
-- Output is very short relative to audio length (model failed to transcribe)
-- Output has abnormal token repetition (common failure mode)
-
-**Step 3 — Build a training dataset**
-Create an HF dataset of `(audio, pseudo_transcript)` pairs and upload or save locally.
-
-**Step 4 — Fine-tune tiny/base on combined data**
-Mix real supervised data (weight 70%) + pseudo-labeled (weight 30%).
-Real supervised data is ground truth; pseudo-labeled data expands coverage.
-
-### Risk
-
-**Tiny and small models learn noise more readily than large models.**
-A bad pseudo-label doesn't "average out" — it trains the model toward the wrong output.
-Strict filtering in Step 2 is essential. If filtering is too loose, pseudo-labeling
-can make WER *worse*.
-
-### Expected gain
-
-~5–15% relative WER improvement over direct fine-tuning on same data, based on
-DistilWhisper results on English. Hebrew may differ.
-
-### Implementation complexity
-
-Medium — needs a separate pseudo-label generation script, then reuses existing
-`finetune.py` with the generated dataset.
-
----
-
-## Option 5: Soft-label distillation
-
-### What it is
-
-Instead of hard pseudo-labels (the small model's best guess), train tiny/base to match
-the **full probability distribution** of small's output at every decoder step.
-
-### Loss function
-
-```
-total_loss = α × CrossEntropy(student_logits, ground_truth_tokens)
-           + (1−α) × KL_divergence(student_logits, teacher_logits)
-```
-
-α = 0.5 is a common default. The KL term pulls the student toward the teacher's
-uncertainty profile, not just its best guess.
-
-### Why it's better than pseudo-labeling
-
-If small is uncertain between `"הוא"` and `"הם"` (he/they, commonly confused), the
-soft label preserves that uncertainty. A hard pseudo-label just picks one and treats
-it as fact, potentially misleading tiny.
-
-### Why it's harder
-
-- Both models must be in memory simultaneously (small frozen as teacher, tiny/base training)
-  — ~300MB total, fine on M4 but requires code changes
-- Cannot use vanilla `Seq2SeqTrainer` — need a custom training loop or subclass
-- `α` tuning adds another hyperparameter
-
-### Expected gain vs pseudo-labeling
-
-Marginal in practice for this task. The simpler pseudo-labeling approach is a better
-first step. Do Option 4 before considering this.
+**Do after Options 1–3** — needs a good teacher model and a validated training pipeline first.
 
 ---
 
 ## Recommended execution order
 
-1. **`hebrew_base_ft`** — fine-tune whisper-base, no new code, ~5h *(next step)*
-2. **`hebrew_small_ft_v2`** — clean 3-epoch run of small, ~17h
-3. **Add crowd-transcribe-v5** to tiny v2 and base — needs multi-dataset loader in finetune.py
-4. **Pseudo-label ivrit-ai/audio-v2** using whisper-small-he, train tiny/base on combined data
-5. **Soft-label distillation** — only if pseudo-labeling results are promising and the effort is justified
+| Priority | Task | Time | Prerequisite |
+|---|---|---|---|
+| 1 | `hebrew_small_ft_v2` — clean 3-epoch small run | ~17h | none |
+| 2 | Eval small_ft_v2 with `scripts/eval.py` | ~10min | small_ft_v2 done |
+| 3 | Write `scripts/distill.py`, distill small→base | ~10h + dev | small_ft_v2 done |
+| 4 | Add crowd-transcribe-v5 to finetune.py | dev + ~5h | none |
+| 5 | Pseudo-label ivrit-ai/audio-v2 with small | dev + hours | small_ft_v2 done |
 
 ---
 
 ## WER comparison notes
 
-All our WER numbers are **unnormalized** (`jiwer.wer()` on raw decoded strings).
-Published English benchmarks use OpenAI's text normalizer (removes punctuation,
-standardizes numbers, contractions, etc.) — those numbers are **not comparable to ours**.
-
-Our numbers ARE comparable to each other (same eval set, same metric).
-
-If we want to publish comparable results or benchmark against other Hebrew models,
-we should add Whisper-style normalization to the eval loop.
+- All WER numbers are **unnormalized** — not comparable to published English benchmarks
+- **Use `scripts/eval.py --samples 2000`** for reliable comparisons; training-time eval (200 samples) is noisy
+- WER > 1.0 is possible: it means the model outputs more words than the reference (insertions)
+- To compare against other Hebrew models, add Whisper-style text normalization to eval loop
