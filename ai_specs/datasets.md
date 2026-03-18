@@ -100,13 +100,35 @@ Average clip length is more important than total hours.
 
 ### `ivrit-ai/audio-v2`
 
-- **Size**: ~800h raw audio (no transcriptions)
-- **Access**: HF (806 downloads)
-- **Why useful**: Large unlabeled pool for pseudo-labeling pipeline —
-  run `whisper-small-he` over it to generate training pairs for tiny/base
-- **Caution**: Machine-generated transcriptions inherit small model errors.
+- **Size**: ~22,000 hours of Hebrew audio, 80+ content sources, 6,000+ speakers
+- **Access**: HF (806 downloads), ivrit.ai license (research + commercial AI training OK)
+- **Content**: Podcasts, YouTube channels — politics, sports, medicine, Gemara lessons, etc.
+  Diverse ages and accents including Hebrew as second language.
+- **Why useful**: Massive unlabeled pool for pseudo-labeling pipeline —
+  run `ivrit-ai/whisper-large-v3-turbo` (not our small model) over it to generate
+  training pairs for tiny/base. Using the strongest available teacher minimizes error propagation.
+- **Caution**: Machine-generated transcriptions inherit teacher model errors.
   Must filter clips where the model is uncertain (repetition loops, [BLANK_AUDIO], very short output)
-- **Status**: Not yet used. Relevant for Option D (pseudo-labeling).
+- **Status**: Not yet used. Relevant for pseudo-labeling after distillation pipeline is built.
+
+## ivrit-ai pre-trained models (for distillation, not training data)
+
+Source: [ivrit-ai HuggingFace](https://huggingface.co/ivrit-ai), [Interspeech 2025 paper](https://www.isca-archive.org/interspeech_2025/marmor25_interspeech.pdf)
+
+ivrit-ai trained Whisper models on **5,050 hours** of Hebrew:
+- ~4,700h `knesset-plenums-whisper-training` (Israeli parliament)
+- ~300h `crowd-transcribe-v5`
+- ~50h `crowd-recital-whisper-training`
+
+| Model | Params | Format | Notes |
+|---|---|---|---|
+| `ivrit-ai/whisper-large-v3` | 2B | HF PyTorch | Best quality, 2-phase training (3 epochs knesset + 1 epoch mixed) |
+| `ivrit-ai/whisper-large-v3-turbo` | 0.8B | HF PyTorch | Distilled from large-v3, 50% fewer params |
+| `ivrit-ai/whisper-large-v3-ct2` | 2B | CTranslate2 | Production inference only |
+| `ivrit-ai/whisper-large-v3-turbo-ct2` | 0.8B | CTranslate2 | Most popular (16.5k downloads/month) |
+
+For distillation: **use HF PyTorch format** (need to extract logits).
+ct2 format is for fast inference only, not suitable as distillation teacher.
 
 ---
 
