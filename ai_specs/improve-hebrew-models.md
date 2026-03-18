@@ -120,51 +120,17 @@ See `ai_specs/datasets.md` for full dataset analysis.
 
 ---
 
-## Option 1: Clean run of small — hebrew_small_ft_v2
+## Option 1: Distillation from ivrit-ai turbo → base and tiny
 
-**Status: not yet done. Still valuable even with ivrit-ai teachers available.**
+**This is the primary path forward.**
 
-A clean 3-epoch cosine run of small establishes the true ceiling for a model we
-fully control and can deploy without external dependencies.
+Using `ivrit-ai/whisper-large-v3-turbo` (0.8B, WER 0.189) as teacher.
 
-**Config to create** (`configs/hebrew_small_ft_v2.yaml`):
-```yaml
-run_name: hebrew_small_ft_v2
-base_model: openai/whisper-small
-output_dir: outputs
-language: he
-dataset_name: ivrit-ai/whisper-training
-text_column: text
-audio_column: audio
-eval_split: test
-streaming: true
-per_device_train_batch_size: 4
-per_device_eval_batch_size: 1
-gradient_accumulation_steps: 4
-max_steps: 15000
-learning_rate: 6.0e-6
-lr_scheduler_type: cosine
-warmup_steps: 500
-save_steps: 250
-save_total_limit: 2
-eval_steps: 250
-device: mps
-fp16: false
-seed: 42
-```
+### Distill into both base AND tiny
 
-**Training time**: ~16–18 hours on M4 MPS.
-**Expected WER**: 0.28–0.32.
-
----
-
-## Option 2: Distillation from ivrit-ai → base
-
-**This is now the most promising path to a fast, accurate model.**
-
-Using `ivrit-ai/whisper-large-v3` or `ivrit-ai/whisper-large-v3-turbo` as the teacher
-instead of our own small model. Their models were trained on 5,050h of Hebrew and
-are dramatically stronger than anything we've fine-tuned.
+Since base didn't beat tiny on direct fine-tuning, distill into both and compare.
+If distilled tiny reaches WER ~0.35–0.40, it may be the better choice — faster than
+base and "good enough" for keyboard dictation.
 
 ### Does this require more data?
 
@@ -180,7 +146,7 @@ loss = α × CrossEntropy(student_logits, ground_truth_tokens)
 
 α = 0.5 is a sensible default.
 
-**Step 1**: Evaluate ivrit-ai teacher models on our eval set to confirm WER.
+**Step 1**: ~~Evaluate ivrit-ai teacher models~~ — done (turbo=0.189, large-v3=0.186).
 
 **Step 2**: Write `scripts/distill.py`:
 - Load teacher (`ivrit-ai/whisper-large-v3-turbo`, 0.8B) frozen
@@ -212,7 +178,7 @@ training dataset significantly.
 
 ---
 
-## Option 3: More training data
+## Option 2: More training data
 
 **Status: not yet done. Complements distillation.**
 
@@ -232,18 +198,30 @@ See `ai_specs/datasets.md` for full dataset details and priority ordering.
 
 ---
 
+## Fallback: Clean run of small — hebrew_small_ft_v2
+
+If distillation doesn't yield good results, fall back to a clean 3-epoch cosine run
+of small. Config ready at `configs/hebrew_small_ft_v2.yaml`.
+
+**Training time**: ~16–18 hours on M4 MPS.
+**Expected WER**: 0.28–0.32.
+
+Small is too slow for keyboard dictation (~6× slower than tiny at inference), so this
+would be a stepping stone — either as a deployment model with latency trade-off, or
+as our own teacher for a second distillation attempt.
+
+---
+
 ## Recommended execution order
 
 | Priority | Task | Time | Prerequisite |
 |---|---|---|---|
-| ~~1~~ | ~~Eval ivrit-ai teacher models~~ | done | turbo=0.189, large-v3=0.186 |
-| 2 | `hebrew_small_ft_v2` — clean 3-epoch small run | ~17h | none |
-| 3 | Write `scripts/distill.py`, distill ivrit-ai-turbo→base | ~10h + dev | eval confirms teacher quality |
-| 4 | Eval distilled base vs fine-tuned small | ~10min | distillation done |
-| 5 | Add crowd-transcribe-v5 multi-dataset support | dev + ~5h | none |
-| 6 | Pseudo-label ivrit-ai/audio-v2 with large-v3 | dev + hours | teacher model confirmed |
-
-Steps 1 and 2 can run in parallel. Step 1 is already running.
+| 1 | Write `scripts/distill.py` | dev | none |
+| 2 | Distill turbo → base | ~10h | distill.py |
+| 3 | Distill turbo → tiny | ~5h | distill.py |
+| 4 | Eval distilled models | ~10min | distillation done |
+| 5 | ACFT on best distilled model | ~2h | eval shows good WER |
+| 6 | Add crowd-transcribe-v5 | dev + training | only if distillation alone isn't enough |
 
 ---
 

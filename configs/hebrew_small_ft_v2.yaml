@@ -1,0 +1,30 @@
+run_name: hebrew_small_ft_v2
+base_model: openai/whisper-small
+output_dir: outputs
+language: he
+
+# Dataset
+dataset_name: ivrit-ai/whisper-training
+text_column: text
+audio_column: audio
+eval_split: test
+streaming: true
+
+# Training - cosine, ~3 epochs
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 4
+max_steps: 15000
+learning_rate: 6.0e-6
+lr_scheduler_type: cosine
+warmup_steps: 500
+
+# Checkpointing - safe resume
+save_steps: 500
+save_total_limit: 2
+eval_steps: 500
+
+# Runtime
+device: mps
+fp16: false
+seed: 42
