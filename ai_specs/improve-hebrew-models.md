@@ -124,57 +124,117 @@ See `ai_specs/datasets.md` for full dataset analysis.
 
 **This is the primary path forward.**
 
-Using `ivrit-ai/whisper-large-v3-turbo` (0.8B, WER 0.189) as teacher.
+Teacher: `ivrit-ai/whisper-large-v3-turbo` (0.8B, WER 0.189).
+Script: `scripts/distill.py` — done.
+Configs: `configs/hebrew_base_distill.yaml`, `configs/hebrew_tiny_distill.yaml`.
 
-### Distill into both base AND tiny
+### Student initialization: start from fine-tuned weights
+
+Students initialize from our fine-tuned models, NOT from original OpenAI weights:
+- Base: `outputs/hebrew_base_ft/final` (WER 0.596, HF: `amitkot/whisper-base-he`)
+- Tiny: `outputs/hebrew_tiny_ft_v2/final` (WER 0.581, HF: `amitkot/whisper-tiny-he`)
+
+**Why**: Fine-tuned models already map Hebrew phonemes → tokens. Distillation refines
+these representations with richer teacher signal. Starting from scratch (WER ~1.0)
+forces learning Hebrew AND matching the teacher simultaneously — harder and slower.
+
+### Why distill into both
 
 Since base didn't beat tiny on direct fine-tuning, distill into both and compare.
-If distilled tiny reaches WER ~0.35–0.40, it may be the better choice — faster than
-base and "good enough" for keyboard dictation.
+If distilled tiny reaches WER ~0.35–0.40, it's the better choice — 2× faster than
+base and good enough for keyboard dictation.
 
-### Does this require more data?
+### Knowledge distillation approach: online soft-label KD
 
-**No.** Distillation works on the same `ivrit-ai/whisper-training` dataset. The teacher
-model generates richer training signal (probability distributions) from the same audio.
+We use **soft-label distillation** (KL divergence on the teacher's full probability
+distribution), not hard pseudo-labeling (teacher's best-guess transcription). Soft labels
+preserve the teacher's uncertainty across the full vocabulary — richer signal than
+a single transcription string.
 
-### Soft-label distillation process
-
+**Loss function:**
 ```
-loss = α × CrossEntropy(student_logits, ground_truth_tokens)
-     + (1−α) × KL_divergence(student_logits, teacher_logits)
+loss = α × CE(student_logits, ground_truth) + (1-α) × KL(student_logits, teacher_logits) × T²
 ```
 
-α = 0.5 is a sensible default.
+| Parameter | Value | Explanation |
+|---|---|---|
+| α (alpha) | 0.5 | Equal weight to ground truth (hard) and teacher (soft) labels |
+| T (temperature) | 2.0 | Softens the teacher's distribution, exposing uncertainty over the full vocab |
+| T² scaling | 4.0 | Compensates for magnitude reduction from temperature scaling |
+| Padding mask | labels != -100 | KL loss computed only at real token positions |
 
-**Step 1**: ~~Evaluate ivrit-ai teacher models~~ — done (turbo=0.189, large-v3=0.186).
+**Online approach**: The teacher runs a forward pass on every training batch alongside
+the student. This means the teacher must be loaded in memory during training — but avoids
+the impractical storage cost of pre-computing soft labels (51,865 vocab × ~20 tokens ×
+4 bytes × 55k examples ≈ 220GB for full logits).
 
-**Step 2**: Write `scripts/distill.py`:
-- Load teacher (`ivrit-ai/whisper-large-v3-turbo`, 0.8B) frozen
-- Load student (base, 74M) — initialize fresh from `openai/whisper-base`
-- For each batch: run teacher in `torch.no_grad()`, get logits
-- Train student with combined CE + KL loss
-- Cosine LR schedule, same as other training runs
+**Implementation**: `DistillationTrainer` subclasses HF `Seq2SeqTrainer`, overriding only
+`compute_loss`. The teacher is stored as an attribute, called under `torch.no_grad()`.
+All Trainer infrastructure works unchanged: checkpointing, resume, eval with WER generation,
+cosine LR, logging. The optimizer only sees student parameters.
 
-**Step 3**: Evaluate with `scripts/eval.py --samples 2000`.
+**Cannot share teacher soft labels across runs**: Because the teacher runs live during
+training (online KD), base and tiny distillation must run sequentially. Each run loads
+the teacher independently. Teacher download is cached after the first run.
 
-**Implementation notes**:
-- Teacher (0.8B) + student (74M) ≈ 3.3GB total fp32 — easily fits M4
-- If using large-v3 (2B) instead of turbo: ~8.3GB total — still fine
-- Cannot use `Seq2SeqTrainer` directly — needs custom training loop
-- Consider using turbo as teacher first (faster, simpler), then large-v3 if needed
+### What checkpoints save
 
-**Expected WER**: With teacher WER 0.189, base could reach 0.30–0.40.
-This would make base competitive with our fine-tuned small (0.367)
-at 3× the inference speed.
+HF Trainer checkpoints include:
+- `model.safetensors` — student model weights
+- `optimizer.pt` — AdamW state (momentum + variance per parameter)
+- `scheduler.pt` — LR scheduler state (exact step)
+- `trainer_state.json` — step, epoch, loss history, best metric
+- `rng_state.pth` — RNG state for reproducibility
 
-### Pseudo-label distillation (simpler alternative)
+**NOT saved** (transient): gradients (discarded after optimizer step), activations
+(recomputed with gradient_checkpointing), teacher model (frozen, loaded from HF on resume).
 
-Run ivrit-ai teacher over the training audio, use its transcriptions as hard labels
-for base training. No custom training loop needed — reuses `finetune.py` directly.
-Less powerful than soft-label but much simpler to implement.
+### Memory on M4 (64GB unified)
 
-Could also pseudo-label `ivrit-ai/audio-v2` (~800h unlabeled) to expand the
-training dataset significantly.
+| Component | Estimated size |
+|---|---|
+| Teacher (turbo, 0.8B fp32, eval mode, no grad) | ~3.2GB |
+| Student weights (base, 74M fp32) | ~0.3GB |
+| Optimizer state (AdamW, 2× student params) | ~0.6GB |
+| Gradients (student only) | ~0.3GB |
+| Activations (with gradient_checkpointing) | ~2–4GB |
+| MPS overhead + data pipeline | ~10–20GB |
+| **Total estimate** | **~20–30GB** |
+
+Below the ~49GB seen during base fine-tuning. If OOM: reduce
+`per_device_train_batch_size` to 2, increase `gradient_accumulation_steps` to 8
+(keeps effective batch size at 16).
+
+### Language and task tokens
+
+Labels currently: `<|startoftranscript|><|notimestamps|>text<|endoftext|>`.
+Missing: `<|he|>` (Hebrew) and `<|transcribe|>` (task).
+
+This matches standard HF Whisper fine-tuning — language/task enforced during generation
+via `generation_config`, not in training labels. Both teacher and student see identical
+decoder inputs, so KL comparison is fair.
+
+**Potential improvement** (try if distillation results disappoint): add prefix tokens
+by calling `tokenizer.set_prefix_tokens(language="he", task="transcribe")` before data
+preparation. This would make labels match how the teacher was likely trained.
+
+### Run commands
+
+```bash
+# Base distillation first (~10h)
+uv run python scripts/distill.py --config configs/hebrew_base_distill.yaml
+
+# Then tiny (~5h)
+uv run python scripts/distill.py --config configs/hebrew_tiny_distill.yaml
+
+# Evaluate both
+uv run python scripts/eval.py outputs/hebrew_base_distill/final outputs/hebrew_tiny_distill/final --samples 2000
+```
+
+Stop/resume: Ctrl+C is safe. Re-run the same command to resume from latest checkpoint.
+Do not change `max_steps` between runs.
+
+**Expected WER**: base 0.30–0.40, tiny 0.35–0.45.
 
 ---
 
