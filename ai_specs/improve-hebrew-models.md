@@ -86,18 +86,18 @@ ivrit-ai trained Whisper models on **5,050 hours** of Hebrew (12× our 400h data
 
 | Model | Params | Format | WER (estimated) | Use as teacher? |
 |---|---|---|---|---|
-| `ivrit-ai/whisper-large-v3` | 2B | HF PyTorch | ~0.05–0.10? | **Best teacher** — highest quality |
-| `ivrit-ai/whisper-large-v3-turbo` | 0.8B | HF PyTorch | ~0.08–0.12? | **Good teacher** — lighter, faster |
+| `ivrit-ai/whisper-large-v3` | 2B | HF PyTorch | **0.186** | Best quality (marginally) |
+| `ivrit-ai/whisper-large-v3-turbo` | 0.8B | HF PyTorch | **0.189** | **Practical teacher choice** — nearly same WER, 60% less compute |
 | `ivrit-ai/whisper-large-v3-ct2` | 2B | CTranslate2 | same | No — can't extract logits |
 | `ivrit-ai/whisper-large-v3-turbo-ct2` | 0.8B | CTranslate2 | same | No — wrong format |
 | `amitkot/whisper-small-he` | 244M | HF PyTorch | 0.367 | Weaker teacher, but ours |
 
-**WER estimates pending** — running `scripts/eval.py` on ivrit-ai models to get actual
-numbers on our eval set. Published WER is in their Interspeech 2025 paper.
+**Key insight**: ivrit-ai turbo (WER 0.189) is nearly 2× better than our small (0.367).
+Using it as teacher dramatically raises the distillation ceiling. A WER 0.189 teacher
+could push base to ~0.30–0.40, competitive with our fine-tuned small at 3× inference speed.
 
-**Key insight**: Using ivrit-ai's large-v3 as teacher instead of our small model
-dramatically raises the distillation ceiling. A WER ~0.05 teacher could push base
-to ~0.25–0.35, potentially matching or beating our fine-tuned small.
+Turbo vs large-v3: virtually identical WER (0.189 vs 0.186) but turbo runs in half the time
+and uses ~3GB vs ~8GB. **Use turbo as teacher.**
 
 **Memory on M4 (64GB unified)**:
 - large-v3 (2B, fp32): ~8GB — fits comfortably
@@ -197,8 +197,8 @@ loss = α × CrossEntropy(student_logits, ground_truth_tokens)
 - Cannot use `Seq2SeqTrainer` directly — needs custom training loop
 - Consider using turbo as teacher first (faster, simpler), then large-v3 if needed
 
-**Expected WER**: If teacher WER is ~0.05–0.10, base could reach 0.25–0.40.
-This would make base competitive with or better than our fine-tuned small (0.367)
+**Expected WER**: With teacher WER 0.189, base could reach 0.30–0.40.
+This would make base competitive with our fine-tuned small (0.367)
 at 3× the inference speed.
 
 ### Pseudo-label distillation (simpler alternative)
@@ -236,7 +236,7 @@ See `ai_specs/datasets.md` for full dataset details and priority ordering.
 
 | Priority | Task | Time | Prerequisite |
 |---|---|---|---|
-| 1 | Eval ivrit-ai teacher models on our test set | ~30min | none |
+| ~~1~~ | ~~Eval ivrit-ai teacher models~~ | done | turbo=0.189, large-v3=0.186 |
 | 2 | `hebrew_small_ft_v2` — clean 3-epoch small run | ~17h | none |
 | 3 | Write `scripts/distill.py`, distill ivrit-ai-turbo→base | ~10h + dev | eval confirms teacher quality |
 | 4 | Eval distilled base vs fine-tuned small | ~10min | distillation done |
