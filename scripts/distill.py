@@ -325,16 +325,15 @@ class DistillationTrainer(Seq2SeqTrainer):
         outputs = model(**inputs)
         ce_loss = outputs.loss
         student_logits = outputs.logits
+        # Teacher forward (frozen, fp16 — cast inputs to match, logits back to fp32)
         with torch.no_grad():
             teacher_outputs = self.teacher(
-                input_features=teacher_features,
+                input_features=teacher_features.to(dtype=self.teacher.dtype),
                 labels=inputs["labels"],
             )
-            teacher_logits = teacher_outputs.logits
+            teacher_logits = teacher_outputs.logits.float()
 
         # Align vocab sizes (large-v3-turbo has 51866 tokens, base/tiny have 51865)
-        # and dtypes (teacher may be fp16, student is fp32)
-        teacher_logits = teacher_logits.to(dtype=student_logits.dtype)
         min_vocab = min(student_logits.size(-1), teacher_logits.size(-1))
         student_logits = student_logits[..., :min_vocab]
         teacher_logits = teacher_logits[..., :min_vocab]
@@ -376,7 +375,7 @@ def train(cfg: DistillConfig) -> None:
     student.generation_config.task = cfg.task
     student.generation_config.forced_decoder_ids = None
 
-    # Load teacher (frozen, half precision for faster inference)
+    # Load teacher (frozen, fp16 for faster inference + less memory)
     print(f"Loading teacher model: {cfg.teacher_model}")
     teacher = WhisperForConditionalGeneration.from_pretrained(
         cfg.teacher_model, torch_dtype=torch.float16,
@@ -392,12 +391,6 @@ def train(cfg: DistillConfig) -> None:
     elif cfg.device == "cuda":
         teacher = teacher.to("cuda")
 
-    # Try torch.compile for faster teacher inference (PyTorch 2.4+ on MPS)
-    try:
-        teacher = torch.compile(teacher)
-        print("Teacher model compiled with torch.compile")
-    except Exception as e:
-        print(f"torch.compile not available for teacher, continuing without: {e}")
 
     # Load data
     print(f"Loading dataset: {cfg.dataset_name} (streaming={cfg.streaming})")
