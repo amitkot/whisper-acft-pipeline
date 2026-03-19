@@ -132,12 +132,20 @@ def load_config(path: Path) -> DistillConfig:
 @dataclasses.dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: WhisperProcessor
+    teacher_processor: WhisperProcessor
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Student features
         input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
+        # Teacher features (may have different mel bins, e.g. 128 vs 80)
+        teacher_features = [{"input_features": f["teacher_input_features"]} for f in features]
+        teacher_batch = self.teacher_processor.feature_extractor.pad(teacher_features, return_tensors="pt")
+        batch["teacher_input_features"] = teacher_batch["input_features"]
+
+        # Labels (shared)
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
 
@@ -152,8 +160,9 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         return batch
 
 
-def load_datasets(cfg: DistillConfig, processor: WhisperProcessor):
-    feature_extractor = processor.feature_extractor
+def load_datasets(cfg: DistillConfig, processor: WhisperProcessor, teacher_processor: WhisperProcessor):
+    student_fe = processor.feature_extractor
+    teacher_fe = teacher_processor.feature_extractor
     tokenizer = processor.tokenizer
     max_label_length = 448
 
@@ -169,8 +178,12 @@ def load_datasets(cfg: DistillConfig, processor: WhisperProcessor):
     def prepare(example):
         audio = example[cfg.audio_column]
         text = str(example[cfg.text_column])
-        example["input_features"] = feature_extractor(
-            audio["array"], sampling_rate=16000
+        audio_array = audio["array"]
+        example["input_features"] = student_fe(
+            audio_array, sampling_rate=16000
+        ).input_features[0]
+        example["teacher_input_features"] = teacher_fe(
+            audio_array, sampling_rate=16000
         ).input_features[0]
         labels = tokenizer(text).input_ids
         example["labels"] = labels[:max_label_length]
@@ -294,10 +307,11 @@ class DistillationTrainer(Seq2SeqTrainer):
         ce_loss = outputs.loss
         student_logits = outputs.logits
 
-        # Teacher forward pass (frozen, no gradients)
+        # Teacher forward pass (frozen, no gradients, own mel features)
+        teacher_features = inputs.pop("teacher_input_features")
         with torch.no_grad():
             teacher_outputs = self.teacher(
-                input_features=inputs["input_features"],
+                input_features=teacher_features,
                 labels=inputs["labels"],
             )
             teacher_logits = teacher_outputs.logits
@@ -331,8 +345,9 @@ def train(cfg: DistillConfig) -> None:
         print(f"Final model already exists at {final_dir}, skipping training.")
         return
 
-    # Load processor & student
+    # Load processors & student
     processor = WhisperProcessor.from_pretrained(cfg.student_model)
+    teacher_processor = WhisperProcessor.from_pretrained(cfg.teacher_model)
     student = WhisperForConditionalGeneration.from_pretrained(cfg.student_model)
     student.generation_config.language = cfg.language
     student.generation_config.task = cfg.task
@@ -354,10 +369,11 @@ def train(cfg: DistillConfig) -> None:
 
     # Load data
     print(f"Loading dataset: {cfg.dataset_name} (streaming={cfg.streaming})")
-    train_ds, ds_for_eval = load_datasets(cfg, processor)
+    train_ds, ds_for_eval = load_datasets(cfg, processor, teacher_processor)
 
     collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
+        teacher_processor=teacher_processor,
         decoder_start_token_id=student.config.decoder_start_token_id,
     )
 
