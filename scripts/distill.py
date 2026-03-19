@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import re
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ from datasets import Audio, load_dataset
 from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
@@ -294,6 +296,20 @@ def find_checkpoint(
 # Distillation Trainer
 # ------------------------------------
 
+class JsonLogCallback(TrainerCallback):
+    """Appends every log entry to a JSON-lines file for live monitoring."""
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        entry = {"step": state.global_step, "epoch": state.epoch, **logs}
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 class DistillationTrainer(Seq2SeqTrainer):
     def __init__(self, teacher_model, temperature, alpha, **kwargs):
         super().__init__(**kwargs)
@@ -419,6 +435,9 @@ def train(cfg: DistillConfig) -> None:
         report_to="none",
     )
 
+    log_path = out_dir / "training_log.jsonl"
+    print(f"Live training log: {log_path}")
+
     trainer = DistillationTrainer(
         teacher_model=teacher,
         temperature=cfg.temperature,
@@ -430,6 +449,7 @@ def train(cfg: DistillConfig) -> None:
         data_collator=collator,
         compute_metrics=make_compute_metrics(processor) if has_eval else None,
         processing_class=processor.feature_extractor,
+        callbacks=[JsonLogCallback(log_path)],
     )
 
     checkpoint = find_checkpoint(out_dir, cfg.resume_from, cfg.resume_latest)
