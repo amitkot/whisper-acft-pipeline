@@ -316,6 +316,11 @@ class DistillationTrainer(Seq2SeqTrainer):
             )
             teacher_logits = teacher_outputs.logits
 
+        # Align vocab sizes (large-v3-turbo has 51866 tokens, base/tiny have 51865)
+        min_vocab = min(student_logits.size(-1), teacher_logits.size(-1))
+        student_logits = student_logits[..., :min_vocab]
+        teacher_logits = teacher_logits[..., :min_vocab]
+
         # KL divergence on temperature-scaled logits, masked at padding positions
         T = self.temperature
         student_log_probs = F.log_softmax(student_logits / T, dim=-1)
