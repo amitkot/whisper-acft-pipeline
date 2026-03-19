@@ -32,4 +32,5 @@ eval_steps: 100
 # Runtime
 device: mps
 fp16: false
+gradient_checkpointing: false
 seed: 42

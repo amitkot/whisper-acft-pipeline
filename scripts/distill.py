@@ -326,7 +326,7 @@ class DistillationTrainer(Seq2SeqTrainer):
         ce_loss = outputs.loss
         student_logits = outputs.logits
         # Teacher forward (frozen, fp16 — cast inputs to match, logits back to fp32)
-        with torch.no_grad():
+        with torch.inference_mode():
             teacher_outputs = self.teacher(
                 input_features=teacher_features.to(dtype=self.teacher.dtype),
                 labels=inputs["labels"],
