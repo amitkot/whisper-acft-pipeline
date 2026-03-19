@@ -218,23 +218,72 @@ decoder inputs, so KL comparison is fair.
 by calling `tokenizer.set_prefix_tokens(language="he", task="transcribe")` before data
 preparation. This would make labels match how the teacher was likely trained.
 
-### Run commands
+### MPS performance: offline beats online by 4×
+
+Benchmarked on M4 Pro 48GB. The 0.8B teacher forward pass dominates online distillation
+(13 of 15 seconds per step). Tested optimizations:
+
+| Optimization | s/step | Verdict |
+|---|---|---|
+| Baseline (fp32 teacher, torch.no_grad) | 18s | — |
+| fp16 teacher + torch.inference_mode | 15s | kept |
+| + PYTORCH_MPS_FAST_MATH=1 | 15s | no change |
+| + PYTORCH_MPS_PREFER_METAL=1 | 20s | **worse** |
+| torch.compile | 35s | **much worse**, do not use on MPS |
+| Disable gradient_checkpointing | 15s | no change (student too small) |
+| batch_size=8 | 17s | worse |
+| Student-only (no teacher) | 2s | **target for offline approach** |
+
+**Conclusion**: MPS cannot run the 0.8B teacher faster than ~0.84s per example regardless
+of batch size (memory bandwidth bound). The solution is to precompute teacher logits
+offline, then train the student without the teacher loaded.
+
+### Execution plan (3 steps)
+
+**Step 1: Precompute teacher logits (~13h, runs unattended)**
 
 ```bash
-# Base distillation first (~10h)
+uv run python scripts/precompute_teacher.py --config configs/hebrew_base_distill.yaml
+```
+
+- Runs teacher over 55k training examples, saves top-100 logits per token position
+- Output: `outputs/hebrew_base_distill/teacher_logits/` (~1.6 GB)
+- Resume: Ctrl+C safe, re-run same command to continue from where it stopped
+- Log: `outputs/hebrew_base_distill/teacher_logits/precompute_log.jsonl`
+- Monitor: `tail -1 outputs/hebrew_base_distill/teacher_logits/precompute_log.jsonl`
+- Speed: ~0.84s per example, batch_size=16, fp16 teacher on MPS
+- **Logits are reusable for both base and tiny distillation**
+
+**Step 2: Distill base (~8.5h) and tiny (~5.5h)**
+
+```bash
+# Base distillation (offline mode, ~2s/step)
 uv run python scripts/distill.py --config configs/hebrew_base_distill.yaml
 
-# Then tiny (~5h)
+# Tiny distillation (reuses same teacher logits)
 uv run python scripts/distill.py --config configs/hebrew_tiny_distill.yaml
-
-# Evaluate both
-uv run python scripts/eval.py outputs/hebrew_base_distill/final outputs/hebrew_tiny_distill/final --samples 2000
 ```
 
 Stop/resume: Ctrl+C is safe. Re-run the same command to resume from latest checkpoint.
 Do not change `max_steps` between runs.
 
+**Step 3: Evaluate**
+
+```bash
+uv run python scripts/eval.py outputs/hebrew_base_distill/final outputs/hebrew_tiny_distill/final --samples 2000
+```
+
 **Expected WER**: base 0.30–0.40, tiny 0.35–0.45.
+
+**Total time: ~27h** (vs ~116h for two online runs).
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `scripts/precompute_teacher.py` | Run teacher once, save top-K logits to disk |
+| `scripts/distill.py` | Train student with precomputed logits (offline) or live teacher (online) |
+| `scripts/eval.py` | Compare models on test set |
 
 ---
 
