@@ -302,13 +302,13 @@ class DistillationTrainer(Seq2SeqTrainer):
         self.alpha = alpha
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # Pop teacher features before student forward (student doesn't expect them)
+        teacher_features = inputs.pop("teacher_input_features")
+
         # Student forward pass (with CE loss from labels)
         outputs = model(**inputs)
         ce_loss = outputs.loss
         student_logits = outputs.logits
-
-        # Teacher forward pass (frozen, no gradients, own mel features)
-        teacher_features = inputs.pop("teacher_input_features")
         with torch.no_grad():
             teacher_outputs = self.teacher(
                 input_features=teacher_features,
@@ -410,6 +410,7 @@ def train(cfg: DistillConfig) -> None:
         dataloader_num_workers=cfg.dataloader_num_workers,
         dataloader_pin_memory=cfg.device != "mps",
         ignore_data_skip=cfg.streaming,
+        remove_unused_columns=False,
         report_to="none",
     )
 
