@@ -7,6 +7,7 @@ language: he
 # Distillation
 temperature: 2.0
 alpha: 0.5
+teacher_logits_dir: outputs/hebrew_base_distill/teacher_logits
 
 # Dataset
 dataset_name: ivrit-ai/whisper-training

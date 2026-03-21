@@ -107,6 +107,9 @@ class DistillConfig:
     seed: int = 42
     dataloader_num_workers: int = 0
 
+    # Offline distillation (precomputed teacher logits)
+    teacher_logits_dir: Optional[str] = None  # path to precomputed logits
+
     # Resume
     resume_from: Optional[str] = None
     resume_latest: bool = True
@@ -354,6 +357,174 @@ class DistillationTrainer(Seq2SeqTrainer):
 
 
 # ------------------------------------
+# Offline distillation (precomputed logits)
+# ------------------------------------
+
+class OfflineDistillDataset(torch.utils.data.IterableDataset):
+    """Yields examples with student audio features + precomputed teacher top-K logits.
+
+    Iterates the streaming audio dataset and the precomputed npz files in lockstep.
+    Both were produced in the same stream order, so they align naturally.
+    """
+
+    def __init__(
+        self,
+        logits_dir: Path,
+        dataset_name: str,
+        dataset_config: Optional[str],
+        split: str,
+        audio_column: str,
+        text_column: str,
+        feature_extractor,
+        tokenizer,
+        seed: int = 42,
+    ):
+        self.logits_dir = logits_dir
+        self.batch_files = sorted(logits_dir.glob("batch_*.npz"))
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.split = split
+        self.audio_column = audio_column
+        self.text_column = text_column
+        self.feature_extractor = feature_extractor
+        self.tokenizer = tokenizer
+        self.seed = seed
+        self.max_label_length = 448
+
+    def __iter__(self):
+        ds = load_dataset(
+            self.dataset_name, self.dataset_config,
+            split=self.split, streaming=True, trust_remote_code=True,
+        )
+        ds = ds.cast_column(self.audio_column, Audio(sampling_rate=16000))
+        stream = iter(ds)
+        example_idx = 0
+
+        for batch_file in self.batch_files:
+            # The filename encodes the stream position: batch_NNNNNN.npz
+            batch_start = int(batch_file.stem.split("_")[1])
+
+            # Skip stream to the right position
+            while example_idx < batch_start:
+                next(stream)
+                example_idx += 1
+
+            data = np.load(batch_file)
+            n_examples = data["labels"].shape[0]
+
+            for i in range(n_examples):
+                # Advance stream, skipping filtered examples
+                while True:
+                    example = next(stream)
+                    example_idx += 1
+                    text = example.get(self.text_column)
+                    audio = example.get(self.audio_column)
+                    if (text and str(text).strip()
+                            and audio and isinstance(audio, dict)
+                            and "array" in audio):
+                        break
+
+                # Compute student features from audio
+                input_features = self.feature_extractor(
+                    audio["array"], sampling_rate=16000
+                ).input_features[0]
+
+                yield {
+                    "input_features": input_features,
+                    "labels": data["labels"][i].tolist(),
+                    "teacher_topk_ids": data["topk_ids"][i],  # (seq, K) uint16
+                    "teacher_topk_vals": data["topk_vals"][i],  # (seq, K) float16
+                }
+
+
+@dataclasses.dataclass
+class OfflineDataCollator:
+    """Collates offline distillation examples with student features + teacher top-K."""
+    processor: WhisperProcessor
+    decoder_start_token_id: int
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Student input features
+        input_features = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        # Labels
+        label_features = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(
+            labels_batch.attention_mask.ne(1), -100
+        )
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+        batch["labels"] = labels
+
+        # Teacher top-K (pad seq dimension to match labels)
+        seq_len = labels.shape[1]
+        topk_ids_list = []
+        topk_vals_list = []
+        for f in features:
+            ids = torch.tensor(f["teacher_topk_ids"].astype(np.int64))  # (seq, K)
+            vals = torch.tensor(f["teacher_topk_vals"].astype(np.float32))
+            # Pad or truncate to match label seq_len
+            cur_len = ids.shape[0]
+            if cur_len < seq_len:
+                pad = torch.zeros(seq_len - cur_len, ids.shape[1], dtype=ids.dtype)
+                ids = torch.cat([ids, pad], dim=0)
+                vals = torch.cat([vals, torch.zeros_like(pad, dtype=vals.dtype)], dim=0)
+            else:
+                ids = ids[:seq_len]
+                vals = vals[:seq_len]
+            topk_ids_list.append(ids)
+            topk_vals_list.append(vals)
+
+        batch["teacher_topk_ids"] = torch.stack(topk_ids_list)  # (B, seq, K)
+        batch["teacher_topk_vals"] = torch.stack(topk_vals_list)  # (B, seq, K)
+        return batch
+
+
+class OfflineDistillationTrainer(Seq2SeqTrainer):
+    """Distillation using precomputed top-K teacher logits (no teacher model loaded)."""
+
+    def __init__(self, temperature, alpha, **kwargs):
+        super().__init__(**kwargs)
+        self.temperature = temperature
+        self.alpha = alpha
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        teacher_topk_ids = inputs.pop("teacher_topk_ids")  # (B, seq, K)
+        teacher_topk_vals = inputs.pop("teacher_topk_vals")  # (B, seq, K)
+
+        outputs = model(**inputs)
+        ce_loss = outputs.loss
+        student_logits = outputs.logits  # (B, seq, V)
+
+        T = self.temperature
+
+        # Full student log-probs over vocabulary
+        student_log_probs = F.log_softmax(student_logits / T, dim=-1)  # (B, seq, V)
+
+        # Gather student log-probs at teacher's top-K positions
+        student_log_probs_topk = student_log_probs.gather(
+            -1, teacher_topk_ids.long()
+        )  # (B, seq, K)
+
+        # Teacher probs (renormalized softmax over top-K logits)
+        teacher_probs_topk = F.softmax(teacher_topk_vals / T, dim=-1)  # (B, seq, K)
+
+        # KL divergence over top-K, masked at padding positions
+        mask = (inputs["labels"] != -100).unsqueeze(-1)  # (B, seq, 1)
+        kl_per_token = (teacher_probs_topk * (
+            teacher_probs_topk.log() - student_log_probs_topk
+        ))  # (B, seq, K)
+        kl_loss = (kl_per_token * mask).sum() / mask.sum()
+        kl_loss = kl_loss * (T ** 2)
+
+        loss = self.alpha * ce_loss + (1 - self.alpha) * kl_loss
+
+        return (loss, outputs) if return_outputs else loss
+
+
+# ------------------------------------
 # Training
 # ------------------------------------
 
@@ -367,46 +538,109 @@ def train(cfg: DistillConfig) -> None:
         print(f"Final model already exists at {final_dir}, skipping training.")
         return
 
-    # Load processors & student
+    # Determine offline vs online mode
+    logits_dir = None
+    if cfg.teacher_logits_dir:
+        logits_dir = Path(cfg.teacher_logits_dir)
+    else:
+        # Auto-detect: check if logits exist at the default location
+        default_logits = out_dir / "teacher_logits"
+        if default_logits.exists() and list(default_logits.glob("batch_*.npz")):
+            logits_dir = default_logits
+
+    offline = logits_dir is not None
+    if offline:
+        print(f"Offline mode: using precomputed logits from {logits_dir}")
+    else:
+        print("Online mode: teacher loaded during training (slow)")
+
+    # Load processor & student
     processor = WhisperProcessor.from_pretrained(cfg.student_model)
-    teacher_processor = WhisperProcessor.from_pretrained(cfg.teacher_model)
     student = WhisperForConditionalGeneration.from_pretrained(cfg.student_model)
     student.generation_config.language = cfg.language
     student.generation_config.task = cfg.task
     student.generation_config.forced_decoder_ids = None
-
-    # Load teacher (frozen, fp16 for faster inference + less memory)
-    print(f"Loading teacher model: {cfg.teacher_model}")
-    teacher = WhisperForConditionalGeneration.from_pretrained(
-        cfg.teacher_model, torch_dtype=torch.float16,
-    )
-    teacher.generation_config.language = cfg.language
-    teacher.generation_config.task = cfg.task
-    teacher.generation_config.forced_decoder_ids = None
-    teacher.requires_grad_(False)
-    teacher.train(False)
-
-    if cfg.device == "mps":
-        teacher = teacher.to("mps")
-    elif cfg.device == "cuda":
-        teacher = teacher.to("cuda")
-
-
-    # Load data
-    print(f"Loading dataset: {cfg.dataset_name} (streaming={cfg.streaming})")
-    train_ds, ds_for_eval = load_datasets(cfg, processor, teacher_processor)
-
-    collator = DataCollatorSpeechSeq2SeqWithPadding(
-        processor=processor,
-        teacher_processor=teacher_processor,
-        decoder_start_token_id=student.config.decoder_start_token_id,
-    )
 
     # Disable fp16 on MPS
     use_fp16 = cfg.fp16
     if use_fp16 and cfg.device == "mps":
         print("WARNING: fp16 disabled on MPS, using fp32")
         use_fp16 = False
+
+    if offline:
+        # Offline: no teacher model needed, load logits from disk
+        train_ds = OfflineDistillDataset(
+            logits_dir=logits_dir,
+            dataset_name=cfg.dataset_name,
+            dataset_config=cfg.dataset_config,
+            split=cfg.train_split,
+            audio_column=cfg.audio_column,
+            text_column=cfg.text_column,
+            feature_extractor=processor.feature_extractor,
+            tokenizer=processor.tokenizer,
+            seed=cfg.seed,
+        )
+        collator = OfflineDataCollator(
+            processor=processor,
+            decoder_start_token_id=student.config.decoder_start_token_id,
+        )
+    else:
+        # Online: load teacher model
+        teacher_processor = WhisperProcessor.from_pretrained(cfg.teacher_model)
+        print(f"Loading teacher model: {cfg.teacher_model}")
+        teacher = WhisperForConditionalGeneration.from_pretrained(
+            cfg.teacher_model, torch_dtype=torch.float16,
+        )
+        teacher.generation_config.language = cfg.language
+        teacher.generation_config.task = cfg.task
+        teacher.generation_config.forced_decoder_ids = None
+        teacher.requires_grad_(False)
+        teacher.train(False)
+        if cfg.device == "mps":
+            teacher = teacher.to("mps")
+        elif cfg.device == "cuda":
+            teacher = teacher.to("cuda")
+
+        print(f"Loading dataset: {cfg.dataset_name} (streaming={cfg.streaming})")
+        train_ds, _ = load_datasets(cfg, processor, teacher_processor)
+        collator = DataCollatorSpeechSeq2SeqWithPadding(
+            processor=processor,
+            teacher_processor=teacher_processor,
+            decoder_start_token_id=student.config.decoder_start_token_id,
+        )
+
+    # Eval dataset (same for both modes)
+    ds_for_eval = None
+    if cfg.eval_split:
+        try:
+            ds_for_eval = load_dataset(
+                cfg.dataset_name, cfg.dataset_config,
+                split=cfg.eval_split, streaming=False, trust_remote_code=True,
+            )
+        except (ValueError, KeyError):
+            print(f"WARNING: eval split '{cfg.eval_split}' not found")
+
+    if ds_for_eval is not None:
+        fe = processor.feature_extractor
+        tok = processor.tokenizer
+        if cfg.max_eval_samples:
+            ds_for_eval = ds_for_eval.select(range(min(cfg.max_eval_samples, len(ds_for_eval))))
+        ds_for_eval = ds_for_eval.cast_column(cfg.audio_column, Audio(sampling_rate=16000))
+        ds_for_eval = ds_for_eval.filter(
+            lambda x: bool(x.get(cfg.text_column) and str(x[cfg.text_column]).strip()
+                          and x.get(cfg.audio_column) and isinstance(x[cfg.audio_column], dict)
+                          and "array" in x[cfg.audio_column])
+        )
+
+        def prepare_eval(example):
+            example["input_features"] = fe(
+                example[cfg.audio_column]["array"], sampling_rate=16000
+            ).input_features[0]
+            labels = tok(str(example[cfg.text_column])).input_ids
+            example["labels"] = labels[:448]
+            return example
+
+        ds_for_eval = ds_for_eval.map(prepare_eval, remove_columns=ds_for_eval.column_names)
 
     has_eval = ds_for_eval is not None
     training_args = Seq2SeqTrainingArguments(
@@ -434,7 +668,7 @@ def train(cfg: DistillConfig) -> None:
         seed=cfg.seed,
         dataloader_num_workers=cfg.dataloader_num_workers,
         dataloader_pin_memory=cfg.device != "mps",
-        ignore_data_skip=cfg.streaming,
+        ignore_data_skip=True,
         remove_unused_columns=False,
         report_to="none",
     )
@@ -442,19 +676,39 @@ def train(cfg: DistillConfig) -> None:
     log_path = out_dir / "training_log.jsonl"
     print(f"Live training log: {log_path}")
 
-    trainer = DistillationTrainer(
-        teacher_model=teacher,
-        temperature=cfg.temperature,
-        alpha=cfg.alpha,
-        model=student,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=ds_for_eval,
-        data_collator=collator,
-        compute_metrics=make_compute_metrics(processor) if has_eval else None,
-        processing_class=processor.feature_extractor,
-        callbacks=[JsonLogCallback(log_path)],
-    )
+    # Use eval collator for eval dataset (no teacher features needed)
+    eval_collator = OfflineDataCollator(
+        processor=processor,
+        decoder_start_token_id=student.config.decoder_start_token_id,
+    ) if offline else collator
+
+    if offline:
+        trainer = OfflineDistillationTrainer(
+            temperature=cfg.temperature,
+            alpha=cfg.alpha,
+            model=student,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=ds_for_eval,
+            data_collator=collator,
+            compute_metrics=make_compute_metrics(processor) if has_eval else None,
+            processing_class=processor.feature_extractor,
+            callbacks=[JsonLogCallback(log_path)],
+        )
+    else:
+        trainer = DistillationTrainer(
+            teacher_model=teacher,
+            temperature=cfg.temperature,
+            alpha=cfg.alpha,
+            model=student,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=ds_for_eval,
+            data_collator=collator,
+            compute_metrics=make_compute_metrics(processor) if has_eval else None,
+            processing_class=processor.feature_extractor,
+            callbacks=[JsonLogCallback(log_path)],
+        )
 
     checkpoint = find_checkpoint(out_dir, cfg.resume_from, cfg.resume_latest)
     trainer.train(resume_from_checkpoint=checkpoint)
