@@ -96,6 +96,8 @@ def main():
     ap.add_argument("--top-k", type=int, default=TOP_K)
     ap.add_argument("--output-dir", type=str, default=None)
     ap.add_argument("--split", type=str, default="train")
+    ap.add_argument("--stop-at", type=int, default=None,
+                    help="Stop after processing this many stream examples (for partial runs)")
     ap.add_argument("--device", type=str, default=None)
     args = ap.parse_args()
 
@@ -195,6 +197,10 @@ def main():
         batch_buffer.append(example)
         example_idx += 1
 
+        # Stop at requested position
+        if args.stop_at and example_idx >= args.stop_at:
+            break
+
         if len(batch_buffer) < batch_size:
             continue
 
@@ -213,7 +219,9 @@ def main():
 
         topk_vals, topk_ids = torch.topk(logits, top_k, dim=-1)
 
-        batch_file = out_dir / f"batch_{examples_processed:06d}.npz"
+        # Name file by stream position (stable across runs)
+        batch_start_idx = example_idx - len(batch_buffer)
+        batch_file = out_dir / f"batch_{batch_start_idx:06d}.npz"
         np.savez_compressed(
             batch_file,
             topk_ids=topk_ids.cpu().numpy().astype(np.uint16),
@@ -230,7 +238,6 @@ def main():
         log_entry = {
             "examples_processed": examples_processed,
             "example_idx": example_idx,
-            "pct_stream": "unknown (streaming)",
             "s_per_example": round(s_per_ex, 2),
             "elapsed_min": round(elapsed / 60, 1),
             "throughput_ex_per_min": round(examples_processed / (elapsed / 60), 1) if elapsed > 0 else 0,
@@ -266,7 +273,8 @@ def main():
 
         topk_vals, topk_ids = torch.topk(logits, top_k, dim=-1)
 
-        batch_file = out_dir / f"batch_{examples_processed:06d}.npz"
+        batch_start_idx = example_idx - len(batch_buffer)
+        batch_file = out_dir / f"batch_{batch_start_idx:06d}.npz"
         np.savez_compressed(
             batch_file,
             topk_ids=topk_ids.cpu().numpy().astype(np.uint16),
