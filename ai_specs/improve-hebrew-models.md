@@ -138,6 +138,20 @@ Students initialize from our fine-tuned models, NOT from original OpenAI weights
 these representations with richer teacher signal. Starting from scratch (WER ~1.0)
 forces learning Hebrew AND matching the teacher simultaneously — harder and slower.
 
+**Uncertainty**: This is our best guess, not established fact. Arguments for starting
+from original OpenAI weights instead:
+- No fine-tuning biases — learns purely from the teacher's distribution
+- Fine-tuned representations may resist teacher corrections if they overfit
+- DistilWhisper (HuggingFace) starts from original weights, not fine-tuned
+- For well-resourced languages, original works fine (pretrained model already capable)
+
+For Hebrew specifically, starting fine-tuned is likely better because the original tiny
+is nearly useless (WER 1.004) — too far from functional for the teacher signal alone
+to bridge the gap efficiently.
+
+**If results disappoint**: try distilling from `openai/whisper-tiny` instead (one config
+line change). Compare WER to determine which initialization is better for Hebrew.
+
 ### Why distill into both
 
 Since base didn't beat tiny on direct fine-tuning, distill into both and compare.
