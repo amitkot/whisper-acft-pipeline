@@ -25,8 +25,8 @@ lr_scheduler_type: cosine
 warmup_steps: 500
 
 # Checkpointing - safe resume
-save_steps: 100
-save_total_limit: 2
+save_steps: 500
+save_total_limit: 3
 eval_steps: 500
 
 # Runtime

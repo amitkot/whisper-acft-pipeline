@@ -313,6 +313,7 @@ class JsonLogCallback(TrainerCallback):
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+
 class DistillationTrainer(Seq2SeqTrainer):
     def __init__(self, teacher_model, temperature, alpha, **kwargs):
         super().__init__(**kwargs)
@@ -662,7 +663,9 @@ def train(cfg: DistillConfig) -> None:
         predict_with_generate=cfg.predict_with_generate,
         generation_max_length=cfg.generation_max_length,
         logging_steps=cfg.logging_steps,
-        load_best_model_at_end=False,
+        load_best_model_at_end=has_eval,
+        metric_for_best_model="wer" if has_eval else None,
+        greater_is_better=False if has_eval else None,
         seed=cfg.seed,
         dataloader_num_workers=cfg.dataloader_num_workers,
         dataloader_pin_memory=cfg.device != "mps",
@@ -711,6 +714,7 @@ def train(cfg: DistillConfig) -> None:
     checkpoint = find_checkpoint(out_dir, cfg.resume_from, cfg.resume_latest)
     trainer.train(resume_from_checkpoint=checkpoint)
 
+    # Save final (with load_best_model_at_end, this is the best WER model)
     trainer.save_model(str(final_dir))
     processor.save_pretrained(str(final_dir))
     print(f"Saved distilled model to: {final_dir}")
