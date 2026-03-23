@@ -1,8 +1,37 @@
 # whisper-acft-pipeline
 
-Reproducible [ACFT (Audio-Context Fine-Tuning)](https://github.com/futo-org/whisper-acft) pipeline for Whisper models, with conversion to ggml format for use with [FUTO Keyboard](https://keyboard.futo.org/) and [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
+Reproducible pipeline for fine-tuning, distilling, and converting Whisper models for Hebrew speech recognition. Designed for keyboard dictation on [FUTO Keyboard](https://keyboard.futo.org/) via [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
 
-Includes training configs for Hebrew models on [Google FLEURS](https://huggingface.co/datasets/google/fleurs) and [ivrit.ai](https://huggingface.co/datasets/ivrit-ai/whisper-training), but can be used with any Whisper model and language by adding a YAML config.
+## Hebrew Model Results
+
+All WER measured on `ivrit-ai/whisper-training` test split, 2000 samples, `jiwer.wer()`, no normalization.
+
+### Fine-tuned models
+
+| Model | Params | WER (untuned) | WER (fine-tuned) | HuggingFace |
+|-------|--------|:-------------:|:----------------:|-------------|
+| whisper-tiny | 39M | 1.004 | **0.581** | [amitkot/whisper-tiny-he](https://huggingface.co/amitkot/whisper-tiny-he) |
+| whisper-base | 74M | 0.851 | **0.596** | [amitkot/whisper-base-he](https://huggingface.co/amitkot/whisper-base-he) |
+| whisper-small | 244M | 0.503 | **0.367** | [amitkot/whisper-small-he](https://huggingface.co/amitkot/whisper-small-he) |
+
+### ACFT models (optimized for short audio / FUTO Keyboard)
+
+| Model | Base | HuggingFace |
+|-------|------|-------------|
+| whisper-tiny-he-acft | amitkot/whisper-tiny-he | [amitkot/whisper-tiny-he-acft](https://huggingface.co/amitkot/whisper-tiny-he-acft) |
+| whisper-small-he-acft | amitkot/whisper-small-he | [amitkot/whisper-small-he-acft](https://huggingface.co/amitkot/whisper-small-he-acft) |
+
+### Teacher models (for distillation)
+
+| Model | Params | WER | Source |
+|-------|--------|:---:|--------|
+| whisper-large-v3-turbo | 0.8B | **0.189** | [ivrit-ai/whisper-large-v3-turbo](https://huggingface.co/ivrit-ai/whisper-large-v3-turbo) |
+| whisper-large-v3 | 2B | **0.186** | [ivrit-ai/whisper-large-v3](https://huggingface.co/ivrit-ai/whisper-large-v3) |
+
+### In progress: distillation
+
+Distilling `ivrit-ai/whisper-large-v3-turbo` (WER 0.189) into whisper-tiny and whisper-base
+to achieve better WER at fast inference speed. See [ai_specs/improve-hebrew-models.md](ai_specs/improve-hebrew-models.md) for the full roadmap.
 
 ## Setup
 
@@ -12,101 +41,92 @@ cd whisper-acft-pipeline
 ./scripts/bootstrap.sh
 ```
 
-Or if already cloned:
+This initializes submodules, builds whisper.cpp, and installs Python dependencies via `uv sync`.
 
-```bash
-./scripts/bootstrap.sh
-```
+> **Note:** The `ivrit-ai/whisper-training` dataset is gated. Run `huggingface-cli login` and accept the dataset terms first.
 
-This will:
-1. Initialize git submodules (`external/whisper.cpp`, `external/whisper`)
-2. Build whisper.cpp (cmake)
-3. Install Python dependencies via `uv sync`
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/finetune.py` | Supervised fine-tuning with `Seq2SeqTrainer`. Streaming datasets, WER eval, auto-resume. |
+| `scripts/distill.py` | Knowledge distillation (online or offline with precomputed logits). |
+| `scripts/precompute_teacher.py` | Precompute teacher top-K logits for offline distillation. |
+| `scripts/acft_train.py` | ACFT training (FUTO-aligned: partial encoder, truncated positional embeddings). |
+| `scripts/pipeline.py` | End-to-end: [finetune →] ACFT → ggml convert → quantize. |
+| `scripts/eval.py` | Evaluate one or more models, report WER table. |
 
 ## Usage
-
-### Available configs
-
-**Fine-tuning** (improve recognition quality):
-
-| Config | Base model | Dataset | run_name |
-|--------|-----------|---------|----------|
-| `configs/hebrew_tiny_finetune.yaml` | [openai/whisper-tiny](https://huggingface.co/openai/whisper-tiny) | [ivrit-ai/whisper-training](https://huggingface.co/datasets/ivrit-ai/whisper-training) (~400h) | `hebrew_tiny_ft` |
-
-**ACFT** (optimize for short audio / FUTO Keyboard):
-
-| Config | Base model | run_name |
-|--------|-----------|----------|
-| `configs/hebrew_tiny_acft.yaml` | [mike249/whisper-tiny-he-2](https://huggingface.co/mike249/whisper-tiny-he-2) | `hebrew_tiny_acft` |
-| `configs/hebrew_small_acft_mike_v4.yaml` | [mike249/whisper-small-he-v4](https://huggingface.co/mike249/whisper-small-he-v4) | `hebrew_small_mike_v4` |
-| `configs/hebrew_small_acft_eeizenman.yaml` | [eeizenman/whisper-small-he](https://huggingface.co/eeizenman/whisper-small-he) | `hebrew_small_eeizenman` |
 
 ### Fine-tune
 
 ```bash
-uv run python scripts/finetune.py --config configs/hebrew_tiny_finetune.yaml
+uv run python scripts/finetune.py --config configs/hebrew_tiny_ft_v2.yaml
 ```
 
-Fine-tunes a Whisper model on a speech-to-text dataset using standard supervised training with `Seq2SeqTrainer`. Supports streaming datasets (no full download needed), WER evaluation, and auto-resume from checkpoints.
-
-The fine-tuned model is saved to `<output_dir>/<run_name>/final/`. This can then be used as the base model for ACFT.
-
-> **Note:** The `ivrit-ai/whisper-training` dataset may be gated. Run `huggingface-cli login` and accept the dataset terms first.
-
-### Train (ACFT)
+### Distill (with precomputed teacher logits)
 
 ```bash
-uv run python scripts/acft_train.py --config configs/hebrew_tiny_acft.yaml
+# Step 1: Precompute teacher logits (~13h, one-time, reusable for all students)
+uv run python scripts/precompute_teacher.py --config configs/hebrew_base_distill.yaml
+
+# Step 2: Distill into student (~6-9h per student)
+uv run python scripts/distill.py --config configs/hebrew_tiny_distill.yaml
+uv run python scripts/distill.py --config configs/hebrew_base_distill.yaml
 ```
 
-Training runs for 8 epochs with batch_size=1, matching the [FUTO reference implementation](https://github.com/futo-org/whisper-acft). The key technique is a partial encoder with truncated positional embeddings, which teaches the model to handle short audio without repeating.
-
-Checkpoints are saved to `<output_dir>/<run_name>/` (as set in the YAML config). Training auto-resumes from the latest checkpoint if one exists.
-
-Config files only need model-specific fields (run_name, base_model, dataset, device). All ACFT-critical params (batch_size, lr, num_epochs, etc.) default to FUTO-aligned values.
-
-### Full pipeline (train + convert + quantize)
+### ACFT + convert + quantize
 
 ```bash
-# ACFT only (existing models)
-uv run python scripts/pipeline.py --config configs/hebrew_tiny_acft.yaml
-
-# Fine-tune + ACFT + convert + quantize
 uv run python scripts/pipeline.py \
-  --finetune-config configs/hebrew_tiny_finetune.yaml \
+  --finetune-config configs/hebrew_tiny_ft_v2.yaml \
   --config configs/hebrew_tiny_acft.yaml
 ```
 
-When `--finetune-config` is provided, the pipeline runs fine-tuning first, then uses the fine-tuned model as the ACFT base model, followed by ggml conversion and quantization. If omitted, the pipeline works as before (ACFT only).
+### Evaluate
 
-The pipeline reads `run_name` and `output_dir` from the config to automatically resolve checkpoint and output paths. GGML files land in `out/<run_name>/`.
+```bash
+uv run python scripts/eval.py \
+    outputs/hebrew_tiny_ft_v2/final \
+    outputs/hebrew_base_ft/final \
+    --samples 2000
+```
 
-Use `--skip-train` if you already have a trained checkpoint and only want conversion/quantization.
+## Configs
+
+Each YAML config has a companion `.md` file explaining all parameter decisions.
+
+| Config | Model | Status |
+|--------|-------|--------|
+| `hebrew_tiny_ft_v2.yaml` | whisper-tiny fine-tune | done (WER 0.581) |
+| `hebrew_base_ft.yaml` | whisper-base fine-tune | done (WER 0.596) |
+| `hebrew_small_finetune.yaml` | whisper-small fine-tune | done (WER 0.367) |
+| `hebrew_tiny_distill.yaml` | distill turbo → tiny | in progress |
+| `hebrew_base_distill.yaml` | distill turbo → base | in progress |
+| `hebrew_tiny_acft.yaml` | ACFT on tiny | done |
+| `hebrew_small_acft.yaml` | ACFT on small | done |
 
 ## Project structure
 
 ```
-configs/                  Training configs (YAML)
+configs/                  Training configs (YAML) + companion docs (.md)
+ai_specs/                 Research notes, dataset analysis, improvement roadmap
 scripts/
   finetune.py             Supervised fine-tuning (Seq2SeqTrainer)
+  distill.py              Knowledge distillation (online + offline modes)
+  precompute_teacher.py   Precompute teacher logits for offline distillation
   acft_train.py           ACFT training script
   pipeline.py             [Finetune →] ACFT → convert → quantize pipeline
+  eval.py                 Multi-model WER evaluation
   bootstrap.sh            One-command project setup
 external/
   whisper.cpp/            (submodule) ggml whisper inference + converter
   whisper/                (submodule) OpenAI Whisper (used by converter)
-pyproject.toml            Python dependencies
-uv.lock                   Locked dependency versions
 ```
-
-### Generated directories (gitignored)
-
-- `outputs/` — training checkpoints (tiny config)
-- `runs/` — training checkpoints (small configs)
-- `out/` — ggml binary files
-- `data/` — downloaded models/datasets (HF cache)
 
 ## Resources
 
-- [whisper-acft](https://github.com/futo-org/whisper-acft) — ACFT fine-tuning method by FUTO
-- [android-keyboard](https://github.com/futo-org/android-keyboard) — FUTO Keyboard (uses ggml Whisper models)
+- [whisper-acft](https://github.com/futo-org/whisper-acft) — ACFT method by FUTO
+- [android-keyboard](https://github.com/futo-org/android-keyboard) — FUTO Keyboard
+- [ivrit.ai](https://www.ivrit.ai/) — Hebrew speech datasets and models
+- [ivrit.ai blog: Fine Tune Whisper the Right Way](https://www.ivrit.ai/en/2025/02/13/training-whisper/)
