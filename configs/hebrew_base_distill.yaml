@@ -5,8 +5,8 @@ output_dir: outputs
 language: he
 
 # Distillation
-temperature: 2.0
-alpha: 0.5
+temperature: 1.0
+alpha: 0.95
 
 # Dataset
 dataset_name: ivrit-ai/whisper-training
