@@ -393,6 +393,11 @@ class OfflineDistillDataset(torch.utils.data.IterableDataset):
         self.max_label_length = 448
 
     def __iter__(self):
+        # Loop forever — Trainer stops at max_steps
+        while True:
+            yield from self._iter_one_epoch()
+
+    def _iter_one_epoch(self):
         ds = load_dataset(
             self.dataset_name, self.dataset_config,
             split=self.split, streaming=True, trust_remote_code=True,
