@@ -406,14 +406,24 @@ class OfflineDistillDataset(torch.utils.data.IterableDataset):
         stream = iter(ds)
         example_idx = 0
 
+        def next_stream():
+            """Advance stream, return (example, new_idx) or None if exhausted."""
+            nonlocal example_idx
+            try:
+                ex = next(stream)
+                example_idx += 1
+                return ex
+            except StopIteration:
+                return None
+
         for batch_file in self.batch_files:
             # The filename encodes the stream position: batch_NNNNNN.npz
             batch_start = int(batch_file.stem.split("_")[1])
 
             # Skip stream to the right position
             while example_idx < batch_start:
-                next(stream)
-                example_idx += 1
+                if next_stream() is None:
+                    return
 
             data = np.load(batch_file)
             n_examples = data["labels"].shape[0]
@@ -421,8 +431,9 @@ class OfflineDistillDataset(torch.utils.data.IterableDataset):
             for i in range(n_examples):
                 # Advance stream, skipping filtered examples
                 while True:
-                    example = next(stream)
-                    example_idx += 1
+                    example = next_stream()
+                    if example is None:
+                        return
                     text = example.get(self.text_column)
                     audio = example.get(self.audio_column)
                     if (text and str(text).strip()
@@ -430,14 +441,15 @@ class OfflineDistillDataset(torch.utils.data.IterableDataset):
                             and "array" in audio):
                         break
 
-                # Compute student features from audio
+                # Compute student features from audio + fresh labels from text
                 input_features = self.feature_extractor(
                     audio["array"], sampling_rate=16000
                 ).input_features[0]
+                labels = self.tokenizer(str(text)).input_ids[:self.max_label_length]
 
                 yield {
                     "input_features": input_features,
-                    "labels": data["labels"][i].tolist(),
+                    "labels": labels,
                     "teacher_topk_ids": data["topk_ids"][i],  # (seq, K) uint16
                     "teacher_topk_vals": data["topk_vals"][i],  # (seq, K) float16
                 }
