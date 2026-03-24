@@ -459,27 +459,26 @@ class OfflineDataCollator:
             labels = labels[:, 1:]
         batch["labels"] = labels
 
-        # Teacher top-K (pad seq dimension to match labels)
-        seq_len = labels.shape[1]
-        topk_ids_list = []
-        topk_vals_list = []
-        for f in features:
-            ids = torch.tensor(f["teacher_topk_ids"].astype(np.int64))  # (seq, K)
-            vals = torch.tensor(f["teacher_topk_vals"].astype(np.float32))
-            # Pad or truncate to match label seq_len
-            cur_len = ids.shape[0]
-            if cur_len < seq_len:
-                pad = torch.zeros(seq_len - cur_len, ids.shape[1], dtype=ids.dtype)
-                ids = torch.cat([ids, pad], dim=0)
-                vals = torch.cat([vals, torch.zeros_like(pad, dtype=vals.dtype)], dim=0)
-            else:
-                ids = ids[:seq_len]
-                vals = vals[:seq_len]
-            topk_ids_list.append(ids)
-            topk_vals_list.append(vals)
-
-        batch["teacher_topk_ids"] = torch.stack(topk_ids_list)  # (B, seq, K)
-        batch["teacher_topk_vals"] = torch.stack(topk_vals_list)  # (B, seq, K)
+        # Teacher top-K (only present in training examples, not eval)
+        if "teacher_topk_ids" in features[0]:
+            seq_len = labels.shape[1]
+            topk_ids_list = []
+            topk_vals_list = []
+            for f in features:
+                ids = torch.tensor(f["teacher_topk_ids"].astype(np.int64))
+                vals = torch.tensor(f["teacher_topk_vals"].astype(np.float32))
+                cur_len = ids.shape[0]
+                if cur_len < seq_len:
+                    pad = torch.zeros(seq_len - cur_len, ids.shape[1], dtype=ids.dtype)
+                    ids = torch.cat([ids, pad], dim=0)
+                    vals = torch.cat([vals, torch.zeros_like(pad, dtype=vals.dtype)], dim=0)
+                else:
+                    ids = ids[:seq_len]
+                    vals = vals[:seq_len]
+                topk_ids_list.append(ids)
+                topk_vals_list.append(vals)
+            batch["teacher_topk_ids"] = torch.stack(topk_ids_list)
+            batch["teacher_topk_vals"] = torch.stack(topk_vals_list)
         return batch
 
 
