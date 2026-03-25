@@ -46,17 +46,19 @@ def run_one(config_path: Path, alpha: float, temp: float, steps: int, output_bas
     run_name = f"_sweep_a{alpha}_t{temp}"
     run_dir = output_base / run_name
 
-    # Create temporary config
+    # Create temporary config — just find the best alpha/temperature.
+    # No checkpoint reuse (LR schedule wouldn't match the full run).
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     cfg["alpha"] = alpha
     cfg["temperature"] = temp
     cfg["max_steps"] = steps
     cfg["run_name"] = run_name
     cfg["output_dir"] = str(output_base)
-    cfg["save_steps"] = steps  # save at the end
-    cfg["eval_steps"] = steps  # eval at the end
+    cfg["save_steps"] = steps + 1  # don't save checkpoints
+    cfg["eval_steps"] = steps
     cfg["save_total_limit"] = 1
     cfg["logging_steps"] = 100
+    cfg["warmup_steps"] = min(cfg.get("warmup_steps", 500), steps // 4)
 
     tmp_config = output_base / f"{run_name}_config.yaml"
     tmp_config.parent.mkdir(parents=True, exist_ok=True)
