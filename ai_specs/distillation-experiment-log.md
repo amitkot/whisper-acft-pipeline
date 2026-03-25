@@ -206,25 +206,79 @@ and the KL signal was too weak (α=0.95) to matter.
 
 ---
 
-## Recommended next experiments (in priority order)
+## Experiment 5: Hyperparameter sweep — fresh student (INCONCLUSIVE)
 
-### Option A: Distill fresh student on same labeled data
-- Student: `openai/whisper-tiny` (not fine-tuned)
-- Same precomputed teacher logits
-- Test multiple alpha values (0.5, 0.7, 0.9) for 1000 steps each
-- Expected: should match or beat fine-tuning (WER 0.581), potentially reaching 0.52-0.55
-- Time: ~6h for full run after alpha sweep
+**Date**: 2026-03-25
+**Script**: `scripts/sweep_distill.py`
 
-### Option B: Pseudo-label unlabeled audio, train on expanded data
-- Run teacher on `ivrit-ai/audio-v2` (22,000h unlabeled Hebrew audio)
-- Generate transcriptions (hard labels, not soft)
-- Train student (fine-tuned or fresh) on labeled (400h) + pseudo-labeled data
-- Expected: significant WER improvement from 50× more data
-- Time: teacher inference on 22,000h + training time
-- Challenge: teacher inference at ~1s/example on MPS = ~22,000 hours → needs GPU cloud
-  or only use a subset (e.g., 2,000h subset ≈ 5× current data)
+**Setup**:
+- Student: `openai/whisper-tiny` (fresh, not fine-tuned)
+- Teacher logits: precomputed top-100 from Experiment 2
+- Grid: alpha × temperature = {0.5, 0.7, 0.9} × {1.0, 2.0} = 6 combinations
+- 1000 steps each, eval at step 1000
 
-### Option C: Distill fresh student on labeled + pseudo-labeled data
-- Combine Options A and B
-- Best of both worlds: fresh student + more data + teacher guidance
-- Requires Option B's pseudo-labeling infrastructure first
+**Results**:
+
+| Alpha | Temp | WER at 1000 steps |
+|---|---|---|
+| 0.7 | 1.0 | 0.801 (best) |
+| 0.9 | 1.0 | 0.808 |
+| 0.5 | 1.0 | 0.820 |
+| 0.9 | 2.0 | 0.852 |
+| 0.5 | 2.0 | 0.889 |
+| 0.7 | 2.0 | 0.904 |
+
+**Assessment**: Inconclusive. At 1000 steps the fresh student is still in early learning
+(WER ~0.80 vs starting 1.004). The alpha ranking at this stage may not predict convergence.
+The sweep design was flawed — 1000 steps is insufficient to differentiate hyperparameters
+for a task that needs 15,000 steps to converge.
+
+**The only reliable signal**: T=1.0 consistently beats T=2.0 across all alphas. But even
+this could reverse at convergence (T=2.0 might pay off later when basics are learned).
+
+---
+
+## Literature review: why our approach has fundamental issues
+
+**Date**: 2026-03-25
+See `ai_specs/distillation-research.md` for full analysis with sources.
+
+**Four compounding problems identified**:
+
+1. **Top-K=100 logit bias**: Published research (ACL 2025, "Don't Ignore the Tail" 2025)
+   confirms that top-K truncation produces biased KL gradients. With K=100 out of V=51,865
+   (0.19% of vocab), the teacher distribution is artificially concentrated. The student is
+   penalized for probability mass outside top-100 with no corrective signal.
+
+2. **Capacity gap (20×)**: Cho & Hariharan (ICCV 2019) show larger teachers aren't always
+   better. At 39M vs 809M, the student may not be able to mimic the teacher distribution.
+
+3. **Architecture mismatch**: DistilWhisper copies teacher layers into the student (same
+   architecture). We can't — different hidden dimensions (384 vs 1280). Our student must
+   learn entirely different internal representations.
+
+4. **Same data / fine-tuned student** (Experiments 3-4): CE teaches nothing new on data
+   the student already trained on.
+
+**What DistilWhisper actually does** (very different from our approach):
+- Initializes student by copying teacher decoder layers
+- Uses pseudo-labels (teacher transcriptions), not ground truth
+- Full-vocab logits for KL (not top-K)
+- 22,000 hours of data (not 400h)
+- Frozen encoder copied from teacher
+
+---
+
+## Revised recommendation
+
+**Drop soft-label KL distillation.** The top-K bias makes it unreliable, and we can't
+follow the DistilWhisper recipe (architecture mismatch prevents layer copying).
+
+**Use pseudo-labeling instead**:
+1. Run teacher on subset of `ivrit-ai/audio-v2` (2,000-5,000h unlabeled)
+2. Save transcriptions as training data
+3. Train student with standard CE (reuses `finetune.py`)
+4. This is what DistilWhisper primarily relies on for quality
+
+The biggest WER improvement comes from **data scale** (50× more data), not from
+loss function tricks. See `ai_specs/improve-hebrew-models.md` for updated roadmap.

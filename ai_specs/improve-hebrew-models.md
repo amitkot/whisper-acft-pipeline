@@ -310,41 +310,39 @@ Distillation adds real value when:
 
 ---
 
-## Option 2: Distill fresh student on same data
+## Option 2: Pseudo-label unlabeled audio (highest expected impact)
 
-**Status: not yet tried. Quick experiment.**
+**Status: not yet done. This is now the primary path.**
 
-Start from `openai/whisper-tiny` (not fine-tuned) with the same precomputed teacher
-logits. Both CE and KL are informative from step 1, since the model hasn't seen the
-data before. Should match or beat fine-tuning alone (WER 0.581).
+Soft-label KL distillation with top-K logits has fundamental issues — see
+`ai_specs/distillation-research.md` for full analysis. The proven approach is
+**pseudo-labeling**: use the teacher to generate transcriptions (hard labels),
+then train the student with standard CE on expanded data.
 
-Test multiple alpha values (0.5, 0.7, 0.9) for 1000 steps each, then full run with
-the best. ~6-8h total.
+This is what DistilWhisper primarily relies on. The biggest WER improvement comes
+from **data scale** (50× more data), not loss function tricks.
 
----
+**Steps**:
+1. Run teacher on subset of `ivrit-ai/audio-v2` (2,000-5,000h unlabeled Hebrew audio)
+2. Filter: discard clips where teacher output has repetition loops, [BLANK_AUDIO], or
+   is very short relative to audio length
+3. Save as a HuggingFace dataset of (audio, pseudo_transcript) pairs
+4. Train student with `finetune.py` on labeled (400h) + pseudo-labeled data
 
-## Option 3: Pseudo-label unlabeled audio (biggest potential gain)
+**Challenge**: Teacher inference at ~1s/example on MPS. For 2,000h of audio
+(assuming ~5s average clip = ~1.4M examples): ~16 days on MPS. Options:
+- Use GPU cloud for teacher inference (hours instead of days)
+- Start with a smaller subset (500h = ~4 days on MPS)
+- Run teacher inference on multiple machines
 
-**Status: not yet done. Highest expected impact.**
-
-Run teacher on `ivrit-ai/audio-v2` (22,000h unlabeled Hebrew audio), generate
-transcriptions, train student on the expanded dataset. This gives 50× more training
-data than our current 400h.
-
-**Challenge**: Teacher inference at ~1s/example on MPS = 22,000h of audio would take
-weeks. Practical approach: use a subset (2,000-5,000h = 5-12× current data).
-
-**Implementation**: Run teacher to generate text transcriptions (not soft logits —
-simpler, no KL needed). Save as a HuggingFace dataset. Train with `finetune.py`
-on the combined labeled + pseudo-labeled data.
-
-See `ai_specs/datasets.md` for dataset details.
+**Implementation**: Needs a pseudo-labeling script (simpler than `precompute_teacher.py`
+— just save text, not logits). Then `finetune.py` needs multi-dataset support.
 
 ---
 
-## Option 4: More labeled training data
+## Option 3: More labeled training data
 
-**Status: not yet done. Complements other approaches.**
+**Status: not yet done. Complements pseudo-labeling.**
 
 Add `ivrit-ai/crowd-transcribe-v5` (~300h, diverse speakers, not gated) to the
 training mix. Needs multi-dataset interleaving loader in `finetune.py`.
@@ -364,12 +362,16 @@ Expected WER: 0.28-0.32. Too slow for keyboard dictation but useful as a baselin
 
 | Priority | Task | Time | Notes |
 |---|---|---|---|
-| 1 | Distill fresh tiny (openai/whisper-tiny + teacher logits) | alpha sweep 1.5h + full run ~6h | Tests if fresh student beats fine-tuned |
-| 2 | Eval all models with `scripts/eval.py --samples 2000` | ~30min | Reliable comparison |
-| 3 | Pseudo-label subset of audio-v2 (2,000-5,000h) | dev + days of inference | Biggest potential WER gain |
-| 4 | Train on expanded data (labeled + pseudo-labeled) | ~6-10h | With or without distillation |
-| 5 | Add crowd-transcribe-v5 to training mix | dev + ~6h | More labeled diversity |
+| 1 | Pseudo-label subset of audio-v2 (500-2,000h) with teacher | dev + days on MPS (or hours on GPU cloud) | Biggest potential WER gain |
+| 2 | Add multi-dataset support to finetune.py | dev | Needed for combined training |
+| 3 | Train on labeled (400h) + pseudo-labeled data | ~6-10h | Standard CE with finetune.py |
+| 4 | Add crowd-transcribe-v5 to training mix | dev + ~6h | More labeled diversity |
+| 5 | Eval all models with `scripts/eval.py --samples 2000` | ~30min | Reliable comparison |
 | 6 | ACFT on best model | ~2h | For FUTO Keyboard deployment |
+
+**Dropped**: Soft-label KL distillation. Top-K logit bias + architecture mismatch +
+capacity gap make this approach unreliable for our setup. See
+`ai_specs/distillation-research.md` for full analysis.
 
 ---
 
