@@ -287,9 +287,18 @@ Do not change `max_steps` between runs.
 uv run python scripts/eval.py outputs/hebrew_base_distill/final outputs/hebrew_tiny_distill/final --samples 2000
 ```
 
-**Expected WER**: base 0.30–0.40, tiny 0.35–0.45.
+### Distillation results so far
 
-**Total time: ~27h** (vs ~116h for two online runs).
+Tiny distillation (fine-tuned student, same data): **0.581 → 0.522 best (0.563 saved)**.
+Modest 10% improvement. See `ai_specs/distillation-experiment-log.md` for full analysis.
+
+**Key learning**: Distilling a fine-tuned student on the same data it was fine-tuned on
+gives diminishing returns. The CE loss (95% of signal) teaches nothing new. The KL loss
+(5%) is too weak to reshape hardened representations.
+
+Distillation adds real value when:
+1. **The data is new** — student hasn't trained on it before
+2. **The student is fresh** — representations are still forming, teacher can guide them
 
 ### Scripts
 
@@ -301,50 +310,66 @@ uv run python scripts/eval.py outputs/hebrew_base_distill/final outputs/hebrew_t
 
 ---
 
-## Option 2: More training data
+## Option 2: Distill fresh student on same data
 
-**Status: not yet done. Complements distillation.**
+**Status: not yet tried. Quick experiment.**
 
-More diverse short Hebrew speech improves robustness across speakers, mics, and accents.
-For dictation, speaker and mic diversity matter more than total hours.
+Start from `openai/whisper-tiny` (not fine-tuned) with the same precomputed teacher
+logits. Both CE and KL are informative from step 1, since the model hasn't seen the
+data before. Should match or beat fine-tuning alone (WER 0.581).
 
-**Best first addition**: `ivrit-ai/crowd-transcribe-v5` (~300h, not gated, diverse speakers).
-Filter `noisy=True` and `multiple_speakers=True` before use.
+Test multiple alpha values (0.5, 0.7, 0.9) for 1000 steps each, then full run with
+the best. ~6-8h total.
 
-**Implementation needed**: Multi-dataset interleaving loader in `finetune.py`:
-```python
-from datasets import interleave_datasets
-combined = interleave_datasets([ds_primary, ds_secondary], probabilities=[0.7, 0.3])
-```
+---
 
-See `ai_specs/datasets.md` for full dataset details and priority ordering.
+## Option 3: Pseudo-label unlabeled audio (biggest potential gain)
+
+**Status: not yet done. Highest expected impact.**
+
+Run teacher on `ivrit-ai/audio-v2` (22,000h unlabeled Hebrew audio), generate
+transcriptions, train student on the expanded dataset. This gives 50× more training
+data than our current 400h.
+
+**Challenge**: Teacher inference at ~1s/example on MPS = 22,000h of audio would take
+weeks. Practical approach: use a subset (2,000-5,000h = 5-12× current data).
+
+**Implementation**: Run teacher to generate text transcriptions (not soft logits —
+simpler, no KL needed). Save as a HuggingFace dataset. Train with `finetune.py`
+on the combined labeled + pseudo-labeled data.
+
+See `ai_specs/datasets.md` for dataset details.
+
+---
+
+## Option 4: More labeled training data
+
+**Status: not yet done. Complements other approaches.**
+
+Add `ivrit-ai/crowd-transcribe-v5` (~300h, diverse speakers, not gated) to the
+training mix. Needs multi-dataset interleaving loader in `finetune.py`.
+
+See `ai_specs/datasets.md` for details and priority ordering.
 
 ---
 
 ## Fallback: Clean run of small — hebrew_small_ft_v2
 
-If distillation doesn't yield good results, fall back to a clean 3-epoch cosine run
-of small. Config ready at `configs/hebrew_small_ft_v2.yaml`.
-
-**Training time**: ~16–18 hours on M4 MPS.
-**Expected WER**: 0.28–0.32.
-
-Small is too slow for keyboard dictation (~6× slower than tiny at inference), so this
-would be a stepping stone — either as a deployment model with latency trade-off, or
-as our own teacher for a second distillation attempt.
+Config ready at `configs/hebrew_small_ft_v2.yaml`. Training: ~16-18h.
+Expected WER: 0.28-0.32. Too slow for keyboard dictation but useful as a baseline.
 
 ---
 
-## Recommended execution order
+## Recommended execution order (revised 2026-03-25)
 
-| Priority | Task | Time | Prerequisite |
+| Priority | Task | Time | Notes |
 |---|---|---|---|
-| 1 | Write `scripts/distill.py` | dev | none |
-| 2 | Distill turbo → base | ~10h | distill.py |
-| 3 | Distill turbo → tiny | ~5h | distill.py |
-| 4 | Eval distilled models | ~10min | distillation done |
-| 5 | ACFT on best distilled model | ~2h | eval shows good WER |
-| 6 | Add crowd-transcribe-v5 | dev + training | only if distillation alone isn't enough |
+| 1 | Distill fresh tiny (openai/whisper-tiny + teacher logits) | alpha sweep 1.5h + full run ~6h | Tests if fresh student beats fine-tuned |
+| 2 | Eval all models with `scripts/eval.py --samples 2000` | ~30min | Reliable comparison |
+| 3 | Pseudo-label subset of audio-v2 (2,000-5,000h) | dev + days of inference | Biggest potential WER gain |
+| 4 | Train on expanded data (labeled + pseudo-labeled) | ~6-10h | With or without distillation |
+| 5 | Add crowd-transcribe-v5 to training mix | dev + ~6h | More labeled diversity |
+| 6 | ACFT on best model | ~2h | For FUTO Keyboard deployment |
 
 ---
 

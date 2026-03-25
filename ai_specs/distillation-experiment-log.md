@@ -127,29 +127,104 @@ Training loss INCREASED over time. Eval WER went from 0.581 → 6+ (garbage outp
 
 ---
 
-## Proposed fixes for next attempt
+---
 
-### Fix 1: Normalize KL loss properly
-The current implementation computes `F.log_softmax(student / T)` over 51,865 tokens
-but `F.softmax(teacher_topk / T)` over only 100 tokens. These are different distributions.
-Options:
-- Compute KL only using the student's probability at the top-K positions, not the full softmax
-- Or scale the KL loss by the number of active tokens to match CE scale
+## Experiment 4: Offline distillation — tiny with fixed labels + α=0.95 (MODEST RESULTS)
 
-### Fix 2: Reduce KL weight drastically
-Change alpha from 0.5 to 0.9 or higher (90% CE, 10% KL). Let the model stay grounded
-in correct Hebrew, with the teacher providing a gentle nudge.
+**Date**: 2026-03-24 to 2026-03-25
+**Config**: `hebrew_tiny_distill.yaml` (offline, α=0.95, T=1.0)
 
-### Fix 3: Lower temperature
-T=1.0 instead of 2.0. Less distribution flattening, more focused on the teacher's
-top predictions.
+**Setup**:
+- Teacher logits: precomputed top-100 from Experiment 2
+- Student: `outputs/hebrew_tiny_ft_v2/final` (39M, WER 0.581)
+- alpha=0.95, temperature=1.0, lr=8e-6, cosine, batch_size=4, grad_accum=4
 
-### Fix 4: Lower learning rate
-3e-6 or even 1e-6. The fine-tuned model is already good — distillation should be a
-gentle refinement, not aggressive retraining.
+**Bugs fixed before this run**:
+1. Labels from npz were already processed (padded, shifted) — collator processed
+   them again → corrupted labels, CE loss ~13. Fixed: use fresh labels from streaming
+   audio text instead of npz labels.
+2. IterableDataset didn't loop for multi-epoch → StopIteration at step 3451.
+   Fixed: wrap in while-True loop with StopIteration handling.
 
-### Fix 5: Sanity check
-Before running 15,000 steps, run 100 steps and check:
-- Is the training loss decreasing?
-- Is the eval WER staying close to the starting model's WER (0.581)?
-If WER jumps above 1.0 in the first 100 steps, abort and adjust hyperparameters.
+**Result**: Model improved modestly.
+
+| Step | Eval WER (200 samples) | Notes |
+|------|------------------------|-------|
+| 0 | 0.581 | Starting point (fine-tuned tiny) |
+| 500 | 0.583 | Flat |
+| 1500 | 0.563 | Starting to improve |
+| 3500 | 0.542 | After epoch boundary |
+| 6500 | 0.527 | |
+| **10000** | **0.522** | **Best (checkpoint deleted by save_total_limit)** |
+| 13500 | 0.536 | |
+| 15000 | 0.563 | Final saved model (regressed from best) |
+
+Best WER: 0.522 (10.1% relative improvement from 0.581).
+Final saved WER: 0.563 (3.1% improvement — best checkpoint was lost).
+
+**Why results were modest — the key insight**:
+
+We distilled a fine-tuned student on the SAME data it was fine-tuned on. This is the
+worst combination for distillation:
+
+1. **CE loss (95% of signal) teaches nothing new.** The student already learned this data
+   over 3 epochs of fine-tuning. Further CE on the same data has diminishing returns.
+2. **KL loss (5% of signal) is too weak to compensate.** At α=0.95, the teacher's
+   distribution provides only a 5% nudge — not enough to meaningfully reshape
+   representations that were already optimized by fine-tuning.
+3. **Starting from fine-tuned weights anchors the model.** The representations are
+   "hardened" from fine-tuning. The teacher signal would be more effective on a fresh
+   model whose representations are still forming.
+
+**Comparison with what fine-tuning achieved:**
+- Fine-tuning openai/whisper-tiny on this data: 1.004 → 0.581 (42% improvement)
+- Distilling on same data with same model: 0.581 → 0.522 (10% improvement)
+- The distillation added only a fraction of the value that fine-tuning provided
+
+---
+
+## Key learning: when distillation adds value
+
+Distillation is most valuable when **at least one** of these is true:
+
+1. **The data is new** — the student hasn't been trained on it before.
+   The CE loss teaches the data, the KL loss shapes how the student learns it.
+
+2. **The student is fresh** — hasn't been fine-tuned on this data.
+   Both CE and KL are informative from step 1. The teacher guides representation
+   formation rather than trying to reshape hardened representations.
+
+We violated both: fine-tuned student on the same data. The CE signal was redundant
+and the KL signal was too weak (α=0.95) to matter.
+
+**Starting from openai/whisper-tiny (fresh) would likely be better:**
+- CE loss is fully informative (model hasn't seen this data)
+- KL loss guides learning from the start
+- Result should match fine-tuning alone (0.581) PLUS teacher bonus
+- Could potentially also use higher alpha (more teacher signal) since the
+  representations aren't anchored yet
+
+---
+
+## Recommended next experiments (in priority order)
+
+### Option A: Distill fresh student on same labeled data
+- Student: `openai/whisper-tiny` (not fine-tuned)
+- Same precomputed teacher logits
+- Test multiple alpha values (0.5, 0.7, 0.9) for 1000 steps each
+- Expected: should match or beat fine-tuning (WER 0.581), potentially reaching 0.52-0.55
+- Time: ~6h for full run after alpha sweep
+
+### Option B: Pseudo-label unlabeled audio, train on expanded data
+- Run teacher on `ivrit-ai/audio-v2` (22,000h unlabeled Hebrew audio)
+- Generate transcriptions (hard labels, not soft)
+- Train student (fine-tuned or fresh) on labeled (400h) + pseudo-labeled data
+- Expected: significant WER improvement from 50× more data
+- Time: teacher inference on 22,000h + training time
+- Challenge: teacher inference at ~1s/example on MPS = ~22,000 hours → needs GPU cloud
+  or only use a subset (e.g., 2,000h subset ≈ 5× current data)
+
+### Option C: Distill fresh student on labeled + pseudo-labeled data
+- Combine Options A and B
+- Best of both worlds: fresh student + more data + teacher guidance
+- Requires Option B's pseudo-labeling infrastructure first
