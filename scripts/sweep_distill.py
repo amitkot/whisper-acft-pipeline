@@ -54,7 +54,7 @@ def run_one(config_path: Path, alpha: float, temp: float, steps: int, output_bas
     cfg["max_steps"] = steps
     cfg["run_name"] = run_name
     cfg["output_dir"] = str(output_base)
-    cfg["save_steps"] = steps + 1  # don't save checkpoints
+    cfg["save_steps"] = steps
     cfg["eval_steps"] = steps
     cfg["save_total_limit"] = 1
     cfg["logging_steps"] = 100
